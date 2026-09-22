@@ -1,29 +1,38 @@
 # =============================================================================
 # CD - Blue/Green (switch de tráfego)
 # =============================================================================
-# Faz o cutover: troca o selector do Service "app-go-active" para a cor
-# informada. É o ÚNICO ponto de mudança entre blue e green — mudança
-# atômica, reversível, sem recriar pods nem esperar rollout.
 #
 # Hosts:
-#   - rolling.local       → Rolling
-#   - app-go.local        → Service app-go-active
-#   - app-go-azul.local   → Service app-go-blue
-#   - app-go-verde.local  → Service app-go-green
+#   rolling.local       → Rolling
+#   app-go.local        → tráfego ativo
+#   app-go-azul.local   → Blue
+#   app-go-verde.local  → Green
 #
-# Uso:
-#   - Ativar green: Run workflow → color: green
-#   - Rollback para blue: Run workflow → color: blue
+# O switch altera somente o selector do Service app-go-active.
+#
+# Fluxo:
+#
+#   PATCH
+#     ↓
+#   validar selector
+#     ↓
+#   validar endpoints
+#     ↓
+#   validar app-go.local
+#
 # =============================================================================
+
 name: CD - Blue/Green (switch de tráfego)
 
 on:
   workflow_dispatch:
     inputs:
       color:
-        description: "Cor que vai receber o tráfego (blue = atual, green = nova)"
+        description: "Cor que vai receber o tráfego"
         type: choice
-        options: [blue, green]
+        options:
+          - blue
+          - green
         required: true
 
 permissions:
@@ -34,15 +43,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+
   switch:
     name: Switch para ${{ inputs.color }}
     runs-on: ubuntu-latest
     environment: aws
 
     steps:
+
       # -----------------------------------------------------------------------
       # SSH
       # -----------------------------------------------------------------------
+
       - name: Configurar chave SSH
         run: |
           mkdir -p ~/.ssh
@@ -52,86 +64,56 @@ jobs:
       # -----------------------------------------------------------------------
       # CUTOVER
       # -----------------------------------------------------------------------
-      # O switch é somente um patch no selector do Service active.
-      #
-      # Não recria Pods.
-      # Não executa rollout.
-      # Não altera os Deployments.
-      # O Service passa a selecionar a cor informada.
-      # -----------------------------------------------------------------------
-      - name: Patch do Service (cutover mínimo e reversível)
+
+      - name: Patch do Service
         run: |
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
             ec2-user@${{ vars.EC2_PUBLIC_IP }} \
-            'sudo /usr/local/bin/kubectl -n blue-green patch svc app-go-active \
+            'sudo /usr/local/bin/kubectl \
+              -n blue-green \
+              patch svc app-go-active \
               -p "{\"spec\":{\"selector\":{\"app\":\"app-go\",\"slot\":\"${{ inputs.color }}\"}}}"'
 
       # -----------------------------------------------------------------------
-      # CONFIRMAÇÃO
+      # CONFIRMAR SELECTOR
       # -----------------------------------------------------------------------
+
       - name: Confirmar selector
         run: |
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+          selector=$(ssh \
+            -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
             ec2-user@${{ vars.EC2_PUBLIC_IP }} \
-            'sudo /usr/local/bin/kubectl -n blue-green get svc app-go-active \
-              -o jsonpath="{.spec.selector}"'
+            'sudo /usr/local/bin/kubectl \
+              -n blue-green \
+              get svc app-go-active \
+              -o jsonpath="{.spec.selector}"')
+
+          echo "Selector atual: $selector"
+
+          expected='{"app":"app-go","slot":"${{ inputs.color }}"}'
+
+          if [ "$selector" != "$expected" ]; then
+            echo "Selector incorreto." >&2
+            echo "Esperado: $expected" >&2
+            echo "Atual:    $selector" >&2
+            exit 1
+          fi
 
       # -----------------------------------------------------------------------
-      # SMOKE TEST VIA INGRESS
+      # CONFIRMAR ENDPOINTS
       # -----------------------------------------------------------------------
-      # O tráfego de produção passa por:
-      #
-      # GitHub Actions
-      #      ↓
-      # EC2
-      #      ↓
-      # Ingress app-go.local
-      #      ↓
-      # Service app-go-active
-      #      ↓
-      # Pod blue OU green
-      #
-      # IMPORTANTE:
-      # app-go.local é o host do Service app-go-active.
-      # -----------------------------------------------------------------------
-      - name: Validar tráfego via Ingress
+
+      - name: Aguardar endpoints do Service ativo
         run: |
           for i in $(seq 1 20); do
-            code=$(curl -s -o /dev/null -w "%{http_code}" \
-              -H "Host: app-go.local" \
-              "http://34.207.225.246/healthz" || true)
 
-            if [ "$code" = "200" ]; then
-              echo "Smoke OK (tentativa $i)"
-              exit 0
-            fi
-
-            echo "tentativa $i — code=$code"
-            sleep 3
-          done
-
-          echo "Switch aplicado, mas o smoke test via Ingress falhou." >&2
-          exit 1
-
-      # -----------------------------------------------------------------------
-      # RESUMO
-      # -----------------------------------------------------------------------
-      - name: Resumo
-        run: |
-          {
-            echo "### Switch concluído"
-            echo ""
-            echo "- Cor ativa agora: \`${{ inputs.color }}\`"
-            echo "- Serviço de tráfego: \`app-go-active\` → \`slot=${{ inputs.color }}\`"
-            echo "- Host ativo: \`app-go.local\`"
-            echo "- Endpoint: \`http://34.207.225.246/healthz\`"
-            echo ""
-            echo "### Hosts disponíveis"
-            echo ""
-            echo "- Rolling: \`rolling.local\`"
-            echo "- Blue/Green ativo: \`app-go.local\`"
-            echo "- Blue: \`app-go-azul.local\`"
-            echo "- Green: \`app-go-verde.local\`"
-            echo ""
-            echo "**Rollback:** rode este workflow novamente com a cor contrária."
-          } >> "$GITHUB_STEP_SUMMARY"
+            endpoints=$(ssh \
+              -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              ec2-user@${{ vars.EC2_PUBLIC_IP }} \
+              'sudo /usr/local/bin/kubectl \
+                -n blue-green \
+                get endpoints app-go-active \
+                -o jsonpath="{.subsets[*].addresses[*].ip}"
