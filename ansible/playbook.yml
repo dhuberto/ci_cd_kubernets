@@ -1,222 +1,61 @@
 ---
 # =============================================================================
-# playbook.yml — configura a EC2 para receber deploys
+# playbook.yml — instala K3s na EC2 e prepara os namespaces
 # =============================================================================
-# Usa hosts: all porque o inventário é passado inline pelo workflow.
+# O K3s já traz embutido:
+#   - containerd (runtime de container)
+#   - kubectl (via `k3s kubectl` ou symlink em /usr/local/bin/kubectl)
+#   - Traefik (Ingress Controller padrão)
+#   - local-path provisioner (StorageClass padrão)
 #
-# Limpeza do cache do DNF:
-#   Usa `dnf clean all` + `rm -rf /var/cache/dnf/*` + `dnf makecache`.
-#   NÃO remover o diretório /var/cache/dnf inteiro — o DNF gerencia
-#   arquivos internos (metadata_lock.pid etc.) e recriar o diretório do
-#   zero quebra a expectativa do DNF.
-#
-# Docker:
-#   Verifica `which docker`. Se não existe, instala com --allowerasing.
-#
-# kind/kubectl/namespaces rodam como root (become: true) para evitar
-# permission denied no docker.sock.
+# Não é necessário instalar Docker, kind, kubectl nem ingress-nginx.
 # =============================================================================
-
-- name: Configurar EC2 para o lab de CD
+- name: Configurar EC2 para o cluster K3s
   hosts: all
   gather_facts: true
   become: false
 
   vars:
-    kind_version: "v0.24.0"
-    kind_cluster_name: "devops-labs"
-    kubectl_version: "v1.31.0"
+    k3s_version: "v1.31.5+k3s1"
+    namespaces:
+      - rolling
+      - blue-green
 
   tasks:
     # =========================================================================
-    # 1) Limpeza do cache do DNF — 3 passos na ordem correta
+    # 1) Instalar K3s Server (single-node)
     # =========================================================================
-    - name: dnf clean all (remove metadados e pacotes baixados)
+    - name: Verificar se o K3s já está instalado
+      stat:
+        path: /usr/local/bin/k3s
+      register: k3s_bin
+
+    - name: Instalar K3s Server
       become: true
-      command: dnf clean all
-      changed_when: false
+      shell: |
+        curl -sfL https://get.k3s.io | \
+          INSTALL_K3S_VERSION={{ k3s_version }} sh -
+      args:
+        creates: /usr/local/bin/k3s
+      when: not k3s_bin.stat.exists
 
-    - name: Remover resíduos físicos em /var/cache/dnf
-      become: true
-      shell: rm -rf /var/cache/dnf/*
-      changed_when: false
-
-    - name: Reconstruir cache do DNF
-      become: true
-      command: dnf makecache
-      changed_when: false
-
-    # =========================================================================
-    # 2) Docker — verifica o binário, instala se necessário
-    # =========================================================================
-    - name: Verificar se o binário docker existe
-      command: which docker
-      register: docker_bin
-      failed_when: false
-      changed_when: false
-
-    - name: Instalar docker se não existe
-      become: true
-      dnf:
-        name: docker
-        state: present
-        allowerasing: true
-      when: docker_bin.rc != 0
-
-    - name: Garantir docker habilitado e rodando
+    - name: Garantir K3s habilitado e rodando
       become: true
       systemd:
-        name: docker
+        name: k3s
         enabled: true
         state: started
 
-    - name: Garantir que o ec2-user está no grupo docker
-      become: true
-      user:
-        name: ec2-user
-        groups: docker
-        append: true
-
-    # =========================================================================
-    # 3) kind
-    # =========================================================================
-    - name: Instalar kind em /usr/local/bin
-      become: true
-      get_url:
-        url: "https://kind.sigs.k8s.io/dl/{{ kind_version }}/kind-linux-amd64"
-        dest: /usr/local/bin/kind
-        mode: "0755"
-        force: true
-
-    - name: Verificar kind instalado
-      stat:
-        path: /usr/local/bin/kind
-      register: kind_bin
-
-    - name: Falhar se kind não existe
-      fail:
-        msg: "kind não foi instalado em /usr/local/bin/kind"
-      when: not kind_bin.stat.exists
-
-    # =========================================================================
-    # 4) kubectl
-    # =========================================================================
-    - name: Instalar kubectl em /usr/local/bin
-      become: true
-      get_url:
-        url: "https://dl.k8s.io/release/{{ kubectl_version }}/bin/linux/amd64/kubectl"
-        dest: /usr/local/bin/kubectl
-        mode: "0755"
-        force: true
-
-    - name: Verificar kubectl instalado
-      stat:
-        path: /usr/local/bin/kubectl
-      register: kubectl_bin
-
-    - name: Falhar se kubectl não existe
-      fail:
-        msg: "kubectl não foi instalado em /usr/local/bin/kubectl"
-      when: not kubectl_bin.stat.exists
-
-    - name: Confirmar que kubectl executa
-      become: true
-      command: /usr/local/bin/kubectl version --client
-      register: kubectl_check
-      changed_when: false
-
-    - name: Mostrar versão do kubectl
-      debug:
-        msg: "{{ kubectl_check.stdout_lines }}"
-
-    # =========================================================================
-    # 5) kind-config.yaml
-    # =========================================================================
-    - name: Criar kind-config.yaml
-      copy:
-        dest: /home/ec2-user/kind-config.yaml
-        owner: ec2-user
-        group: ec2-user
-        mode: "0644"
-        content: |
-          kind: Cluster
-          apiVersion: kind.x-k8s.io/v1alpha4
-          networking:
-            apiServerAddress: "0.0.0.0"
-            apiServerPort: 6443
-          nodes:
-            - role: control-plane
-              kubeadmConfigPatches:
-                - |
-                  kind: InitConfiguration
-                  nodeRegistration:
-                    kubeletExtraArgs:
-                      node-labels: "ingress-ready=true"
-              extraPortMappings:
-                - { containerPort: 80,  hostPort: 80,  protocol: TCP }
-                - { containerPort: 443, hostPort: 443, protocol: TCP }
-
-    # =========================================================================
-    # 6) Cluster kind — como root
-    # =========================================================================
-    - name: Verificar se o cluster kind já existe
-      become: true
-      command: /usr/local/bin/kind get clusters
-      register: kind_clusters
-      failed_when: false
-      changed_when: false
-
-    - name: Criar cluster kind
-      become: true
-      command: >
-        /usr/local/bin/kind create cluster
-        --name {{ kind_cluster_name }}
-        --config /home/ec2-user/kind-config.yaml
-      when: kind_cluster_name not in kind_clusters.stdout
-
     - name: Aguardar o nó ficar Ready
       become: true
-      command: /usr/local/bin/kubectl wait --for=condition=Ready node --all --timeout=180s
+      shell: |
+        k3s kubectl wait --for=condition=Ready node --all --timeout=180s
       changed_when: false
 
     # =========================================================================
-    # 7) ingress-nginx
-    # =========================================================================
-    - name: Aplicar manifest do ingress-nginx (kind)
-      become: true
-      command: >
-        /usr/local/bin/kubectl apply -f
-        https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
-
-    - name: Aguardar ingress-nginx
-      become: true
-      command: >
-        /usr/local/bin/kubectl wait --namespace ingress-nginx
-        --for=condition=ready pod
-        --selector=app.kubernetes.io/component=controller
-        --timeout=240s
-      changed_when: false
-
-    # =========================================================================
-    # 8) Namespaces
-    # =========================================================================
-    - name: Criar namespaces do lab
-      become: true
-      command: /usr/local/bin/kubectl create ns {{ item }}
-      register: ns_create
-      failed_when: >
-        ns_create.rc != 0 and
-        'already exists' not in (ns_create.stderr | default(''))
-      changed_when: ns_create.rc == 0
-      loop:
-        - rolling
-        - blue-green
-
-    # =========================================================================
-    # 9) Copiar kubeconfig para o ec2-user
+    # 2) Preparar o kubeconfig para o ec2-user
     # =========================================================================
     - name: Criar diretório .kube do ec2-user
-      become: true
       file:
         path: /home/ec2-user/.kube
         state: directory
@@ -224,22 +63,57 @@
         group: ec2-user
         mode: "0700"
 
-    - name: Copiar kubeconfig do root para o ec2-user
+    - name: Copiar kubeconfig do K3s para o ec2-user
       become: true
       copy:
-        src: /root/.kube/config
+        src: /etc/rancher/k3s/k3s.yaml
         dest: /home/ec2-user/.kube/config
         remote_src: true
         owner: ec2-user
         group: ec2-user
         mode: "0600"
 
+    - name: Descobrir IP privado da EC2
+      shell: hostname -I | awk '{print $1}'
+      register: private_ip
+      changed_when: false
+
+    - name: Substituir 127.0.0.1 pelo IP privado no kubeconfig
+      replace:
+        path: /home/ec2-user/.kube/config
+        regexp: '127\.0\.0\.1'
+        replace: "{{ private_ip.stdout }}"
+
     # =========================================================================
-    # 10) Log final
+    # 3) Criar symlink do kubectl
+    # =========================================================================
+    - name: Criar symlink do kubectl
+      become: true
+      file:
+        src: /usr/local/bin/k3s
+        dest: /usr/local/bin/kubectl
+        state: link
+        force: true
+
+    # =========================================================================
+    # 4) Criar namespaces do lab
+    # =========================================================================
+    - name: Criar namespaces do lab
+      become: true
+      command: k3s kubectl create ns {{ item }}
+      register: ns_create
+      failed_when: >
+        ns_create.rc != 0 and
+        'already exists' not in (ns_create.stderr | default(''))
+      changed_when: ns_create.rc == 0
+      loop: "{{ namespaces }}"
+
+    # =========================================================================
+    # 5) Log final
     # =========================================================================
     - name: Mostrar nodes
       become: true
-      command: /usr/local/bin/kubectl get nodes -o wide
+      command: k3s kubectl get nodes -o wide
       register: nodes_out
       changed_when: false
 
