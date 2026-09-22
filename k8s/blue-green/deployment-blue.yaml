@@ -1,60 +1,92 @@
 # =============================================================================
 # deployment-blue.yaml — slot BLUE
 # =============================================================================
-# APP_COLOR=blue faz a interface ficar azul quando o slot está ativo.
-# labels slot=blue casam com o Service app-go-blue e com o selector
-# do Service app-go-active (durante o switch).
+# Labels:
+#   app=app-go
+#   slot=blue
+#
+# Essas labels são utilizadas pelos Services:
+#   app-go-blue
+#   app-go-active
 # =============================================================================
+
 apiVersion: apps/v1
 kind: Deployment
+
 metadata:
   name: app-go-blue
   namespace: blue-green
   labels:
     app: app-go
     slot: blue
+
 spec:
   replicas: 2
+
   selector:
     matchLabels:
       app: app-go
       slot: blue
+
   template:
     metadata:
       labels:
         app: app-go
         slot: blue
+
     spec:
       serviceAccountName: app-go-sa
+
       containers:
         - name: app
           image: IMAGE_PLACEHOLDER
           imagePullPolicy: Always
+
           ports:
-            - containerPort: 5000
+            - name: http
+              containerPort: 5000
+
           env:
             - name: APP_NAME
               value: "APP-GO Blue"
+
             - name: APP_COLOR
               value: "blue"
+
             - name: APP_PORT
               value: "5000"
+
             - name: DB_HOST
               value: "postgres"
+
             - name: DB_PORT
               value: "5432"
+
             - name: DB_USER
-              value: "appuser"
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_USER
+
             - name: DB_PASSWORD
-              value: "mudar123"
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_PASSWORD
+
             - name: DB_NAME
-              value: "appdb"
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_DB
+
           readinessProbe:
             httpGet:
               path: /healthz
               port: 5000
             initialDelaySeconds: 5
             periodSeconds: 5
+
           livenessProbe:
             httpGet:
               path: /healthz
