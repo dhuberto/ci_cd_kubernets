@@ -1,161 +1,128 @@
----
 # =============================================================================
-# playbook.yml — prepara EC2 para K3s
+# KUBERNETES - ROLLING UPDATE
 # =============================================================================
-#
-# Responsabilidades:
-#   1. Instalar K3s Server
-#   2. Garantir K3s ativo
-#   3. Configurar kubeconfig para ec2-user
-#   4. Disponibilizar kubectl para ec2-user
-#   5. Criar namespaces da aplicação
-#   6. Validar o cluster
-#
-# O K3s fornece:
-#   - containerd
-#   - kubectl via k3s kubectl
-#   - Traefik
-#   - local-path-provisioner
-#
-# Hosts da aplicação são responsabilidade dos Ingresses:
-#   - rolling.local
-#   - app-go.local
-#   - app-go-azul.local
-#   - app-go-verde.local
-# =============================================================================
+# Deployment da aplicação Go no namespace rolling; a imagem é preenchida pelo CD.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-go
+  namespace: rolling
+  labels:
+    app: app-go
+    deployment: rolling
 
-- name: Configurar EC2 para o cluster K3s
-  hosts: all
-  gather_facts: true
-  become: false
+# Configuração do RollingUpdate.
+spec:
+  replicas: 2
 
-  vars:
-    k3s_version: "v1.31.5+k3s1"
+  # Mantém disponibilidade durante a atualização.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
 
-    namespaces:
-      - rolling
-      - blue-green
+  # Seleciona os Pods pertencentes ao Deployment.
+  selector:
+    matchLabels:
+      app: app-go
 
-  tasks:
+  # Configuração dos Pods criados pelo Deployment.
+  template:
+    metadata:
+      labels:
+        app: app-go
 
-    # =========================================================================
-    # 1. K3s
-    # =========================================================================
+    spec:
+      # ServiceAccount usada pela aplicação.
+      serviceAccountName: app-go-sa
 
-    - name: Verificar se K3s já está instalado
-      stat:
-        path: /usr/local/bin/k3s
-      register: k3s_bin
+      # Permite baixar a imagem privada do GHCR.
+      imagePullSecrets:
+        - name: ghcr-secret
 
-    - name: Instalar K3s Server
-      become: true
-      shell: |
-        curl -sfL https://get.k3s.io | \
-          INSTALL_K3S_VERSION={{ k3s_version }} sh -
-      args:
-        creates: /usr/local/bin/k3s
-      when: not k3s_bin.stat.exists
+      # Tempo para encerramento controlado do Pod.
+      terminationGracePeriodSeconds: 30
 
-    - name: Garantir K3s habilitado e rodando
-      become: true
-      systemd:
-        name: k3s
-        enabled: true
-        state: started
+      containers:
+        - name: app
 
-    - name: Aguardar o nó ficar Ready
-      become: true
-      command:
-        argv:
-          - /usr/local/bin/k3s
-          - kubectl
-          - wait
-          - --for=condition=Ready
-          - node
-          - --all
-          - --timeout=180s
-      changed_when: false
+          # Substituído pelo GitHub Actions durante o deploy.
+          image: IMAGE_PLACEHOLDER
+          imagePullPolicy: Always
 
-    # =========================================================================
-    # 2. Kubeconfig do ec2-user
-    # =========================================================================
+          # Porta HTTP da aplicação Go.
+          ports:
+            - name: http
+              containerPort: 5000
+              protocol: TCP
 
-    - name: Criar diretório .kube
-      file:
-        path: /home/ec2-user/.kube
-        state: directory
-        owner: ec2-user
-        group: ec2-user
-        mode: "0700"
+          # Variáveis utilizadas pela aplicação.
+          env:
+            - name: APP_NAME
+              value: "APP-GO Rolling"
 
-    - name: Copiar kubeconfig do K3s
-      become: true
-      copy:
-        src: /etc/rancher/k3s/k3s.yaml
-        dest: /home/ec2-user/.kube/config
-        remote_src: true
-        owner: ec2-user
-        group: ec2-user
-        mode: "0600"
+            - name: APP_COLOR
+              value: "purple"
 
-    - name: Descobrir IP privado da EC2
-      command:
-        cmd: hostname -I
-      register: hostname_ips
-      changed_when: false
+            - name: APP_PORT
+              value: "5000"
 
-    - name: Definir IP privado
-      set_fact:
-        private_ip: "{{ hostname_ips.stdout.split()[0] }}"
+            - name: DB_HOST
+              value: "postgres"
 
-    - name: Configurar endpoint do kubeconfig
-      become: true
-      replace:
-        path: /home/ec2-user/.kube/config
-        regexp: 'https://127\.0\.0\.1:6443'
-        replace: 'https://{{ private_ip }}:6443'
+            - name: DB_PORT
+              value: "5432"
 
-    # =========================================================================
-    # 3. kubectl
-    # =========================================================================
+            - name: DB_USER
+              value: "appuser"
 
-    - name: Criar symlink kubectl
-      become: true
-      file:
-        src: /usr/local/bin/k3s
-        dest: /usr/local/bin/kubectl
-        state: link
-        force: true
+            # Senha carregada do Secret do PostgreSQL.
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_PASSWORD
 
-    - name: Garantir acesso do ec2-user ao kubectl
-      command:
-        cmd: /usr/local/bin/kubectl version --client
-      environment:
-        KUBECONFIG: /home/ec2-user/.kube/config
-      changed_when: false
+            - name: DB_NAME
+              value: "appdb"
 
-    - name: Validar acesso do ec2-user ao cluster
-      command:
-        cmd: /usr/local/bin/kubectl get nodes -o wide
-      environment:
-        KUBECONFIG: /home/ec2-user/.kube/config
-      become: false
-      become_user: ec2-user
-      register: nodes_check
-      changed_when: false
+          # Verifica quando o Pod pode receber tráfego.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+            successThreshold: 1
 
-    # =========================================================================
-    # 4. Namespaces
-    # =========================================================================
+          # Reinicia o container se a aplicação deixar de responder.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+            successThreshold: 1
 
-    - name: Criar namespaces da aplicação
-      command:
-        cmd: /usr/local/bin/kubectl create namespace {{ item }}
-      environment:
-        KUBECONFIG: /home/ec2-user/.kube/config
-      register: namespace_result
-      failed_when:
-        - namespace_result.rc != 0
-        - "'AlreadyExists' not in (namespace_result.stderr | default(''))"
-      changed_when: namespace_result.rc == 0
-      loop: "{{
+          # Limites de CPU e memória do container.
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+
+          # Aguarda antes de encerrar o processo durante o rollout.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - "sleep 5"
