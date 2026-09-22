@@ -5,9 +5,9 @@
 #   1. Build + push da imagem para o GHCR
 #   2. SSH na EC2
 #   3. Renderiza o Deployment com a imagem
-#   4. Valida os manifestos YAML
-#   5. Copia os manifestos para a EC2
-#   6. Valida os manifestos no Kubernetes
+#   4. Valida os manifests YAML
+#   5. Copia os manifests para a EC2
+#   6. Valida os manifests no Kubernetes
 #   7. Aplica PostgreSQL
 #   8. Aplica RBAC + Deployment + Service + Ingress
 #   9. Aguarda o rollout
@@ -18,10 +18,6 @@
 #
 # IP:
 #   ${{ vars.EC2_PUBLIC_IP }}
-#
-# IMPORTANTE:
-#   O IP da EC2 NÃO fica hardcoded neste workflow.
-#   Altere somente a variável EC2_PUBLIC_IP no Environment "aws".
 # =============================================================================
 
 name: CD - Rolling Update
@@ -81,19 +77,19 @@ jobs:
           cache: false
 
       # -----------------------------------------------------------------------
-      # Validar módulo Go
+      # Validar arquivos Go
       # -----------------------------------------------------------------------
-      # go.mod e go.sum devem estar versionados no repositório.
-      # O CD não deve criar ou modificar dependências.
+      # Apenas verifica se os arquivos necessários existem.
+      # A validação completa do código deve ficar no CI.
       # -----------------------------------------------------------------------
-      - name: Validar módulo Go
+      - name: Validar arquivos da aplicação
         run: |
-          set -e
-
           test -f go.mod
           test -f go.sum
+          test -f Dockerfile
+          test -f src/main.go
 
-          go mod verify
+          echo "Arquivos da aplicação encontrados."
 
       # -----------------------------------------------------------------------
       # Setup Buildx
@@ -122,7 +118,7 @@ jobs:
           tags: ${{ env.IMAGE_NAME }}
 
       # -----------------------------------------------------------------------
-      # Resumo do build
+      # Resumo
       # -----------------------------------------------------------------------
       - name: Resumo do build
         run: |
@@ -131,8 +127,6 @@ jobs:
             echo ""
             echo "- Tag: \`${{ env.IMAGE_TAG }}\`"
             echo "- Imagem: \`${{ env.IMAGE_NAME }}\`"
-            echo "- Namespace: \`${{ env.NAMESPACE }}\`"
-            echo "- Host: \`${{ env.ROLLING_HOST }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
 
@@ -158,25 +152,22 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Validar configuração da EC2
         run: |
-          set -e
-
           if [ -z "${EC2_HOST}" ]; then
-            echo "ERRO: a variável EC2_PUBLIC_IP não está configurada."
+            echo "ERRO: EC2_PUBLIC_IP não está configurada."
+            echo ""
             echo "Configure em:"
             echo "GitHub → Settings → Environments → aws → Variables"
             exit 1
           fi
 
-          echo "EC2 configurada: ${EC2_HOST}"
+          echo "EC2 configurada."
           echo "Host Rolling: ${ROLLING_HOST}"
 
       # -----------------------------------------------------------------------
-      # Configurar chave SSH
+      # Configurar SSH
       # -----------------------------------------------------------------------
       - name: Configurar chave SSH
         run: |
-          set -e
-
           mkdir -p ~/.ssh
 
           printf '%s\n' '${{ secrets.EC2_SSH_KEY }}' > ~/.ssh/deploy_key
@@ -193,8 +184,6 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Renderizar manifesto com a imagem
         run: |
-          set -e
-
           test -f k8s/rolling/deployment.yaml
 
           sed -i \
@@ -205,13 +194,7 @@ jobs:
           grep -n "image:" k8s/rolling/deployment.yaml
 
       # -----------------------------------------------------------------------
-      # Validar YAML dos manifests
-      # -----------------------------------------------------------------------
-      # Esta etapa evita enviar um YAML quebrado para a EC2.
-      #
-      # Exemplo de erro que será detectado aqui:
-      #
-      # yaml: line 162: found unexpected end of stream
+      # Validar YAML
       # -----------------------------------------------------------------------
       - name: Validar YAML dos manifests
         run: |
@@ -241,7 +224,7 @@ jobs:
           '
 
       # -----------------------------------------------------------------------
-      # Testar conexão SSH
+      # Testar SSH
       # -----------------------------------------------------------------------
       - name: Testar conexão SSH
         run: |
@@ -253,7 +236,7 @@ jobs:
             'echo "SSH OK"'
 
       # -----------------------------------------------------------------------
-      # Preparar diretório remoto
+      # Preparar diretório
       # -----------------------------------------------------------------------
       - name: Preparar diretório na EC2
         run: |
@@ -275,11 +258,7 @@ jobs:
             "${{ env.EC2_USER }}@${{ env.EC2_HOST }}:/home/ec2-user/rolling/"
 
       # -----------------------------------------------------------------------
-      # Validar acesso ao Kubernetes
-      # -----------------------------------------------------------------------
-      # Não usa sudo.
-      #
-      # O kubectl deve estar configurado para o ec2-user.
+      # Validar Kubernetes
       # -----------------------------------------------------------------------
       - name: Validar acesso ao Kubernetes
         run: |
@@ -301,7 +280,7 @@ jobs:
             'kubectl get namespace rolling >/dev/null 2>&1 || kubectl create namespace rolling'
 
       # -----------------------------------------------------------------------
-      # Criar / atualizar imagePullSecret
+      # Criar imagePullSecret
       # -----------------------------------------------------------------------
       - name: Criar imagePullSecret
         run: |
@@ -317,9 +296,7 @@ jobs:
               -o yaml | kubectl apply -f -"
 
       # -----------------------------------------------------------------------
-      # Dry-run no Kubernetes
-      # -----------------------------------------------------------------------
-      # Valida contra a API do cluster ANTES de alterar os recursos.
+      # Dry-run Kubernetes
       # -----------------------------------------------------------------------
       - name: Validar manifests no Kubernetes
         run: |
@@ -383,7 +360,7 @@ jobs:
                --timeout=180s'
 
       # -----------------------------------------------------------------------
-      # Diagnóstico em caso de falha
+      # Diagnóstico
       # -----------------------------------------------------------------------
       - name: Diagnóstico
         if: failure()
@@ -431,17 +408,7 @@ jobs:
                --sort-by=.lastTimestamp'
 
       # -----------------------------------------------------------------------
-      # Smoke test via Ingress
-      # -----------------------------------------------------------------------
-      # IP vem dinamicamente de:
-      #
-      # GitHub → Settings → Environments → aws → Variables
-      #
-      # Variable:
-      #   EC2_PUBLIC_IP
-      #
-      # Host:
-      #   rolling.local
+      # Smoke test
       # -----------------------------------------------------------------------
       - name: Smoke test via rolling.local
         run: |
@@ -450,7 +417,7 @@ jobs:
           echo "================================================="
           echo "IP:   ${{ env.EC2_HOST }}"
           echo "Host: ${{ env.ROLLING_HOST }}"
-          echo "URL:  http://${{ env.EC2_HOST }}/healthz"
+          echo "Path: /healthz"
           echo "================================================="
 
           for i in $(seq 1 20); do
@@ -486,7 +453,7 @@ jobs:
           exit 1
 
       # -----------------------------------------------------------------------
-      # Resumo final
+      # Resumo
       # -----------------------------------------------------------------------
       - name: Resumo do deploy
         if: success()
@@ -498,6 +465,6 @@ jobs:
             echo "- Namespace: \`${{ env.NAMESPACE }}\`"
             echo "- Deployment: \`${{ env.APP_NAME }}\`"
             echo "- Host: \`${{ env.ROLLING_HOST }}\`"
-            echo "- IP atual: \`${{ env.EC2_HOST }}\`"
+            echo "- IP: \`${{ env.EC2_HOST }}\`"
             echo "- Smoke test: **OK**"
           } >> "$GITHUB_STEP_SUMMARY"
