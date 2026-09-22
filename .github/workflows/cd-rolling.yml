@@ -2,23 +2,29 @@
 # CD - Rolling Update
 # =============================================================================
 # Fluxo:
-#   1. Checkout
-#   2. Build + push da imagem para o GHCR
-#   3. SSH na EC2
-#   4. Renderiza o Deployment com a imagem
-#   5. Valida os manifests YAML
-#   6. Copia os manifests
-#   7. Valida os manifests no Kubernetes
-#   8. Aplica PostgreSQL
-#   9. Aplica RBAC + Deployment + Service + Ingress
-#  10. Aguarda o rollout
-#  11. Smoke test via rolling.local
-#
-# Configuração:
-#   EC2_PUBLIC_IP = variável do GitHub Environment "aws"
+#   1. Build + push da imagem para o GHCR
+#   2. SSH na EC2
+#   3. Renderiza o Deployment com a imagem
+#   4. Valida os manifests YAML
+#   5. Copia os manifests
+#   6. Valida acesso ao K3s
+#   7. Cria/atualiza imagePullSecret
+#   8. Valida manifests com dry-run
+#   9. Aplica PostgreSQL
+#  10. Aplica RBAC + Deployment + Service + Ingress
+#  11. Aguarda rollout
+#  12. Smoke test via rolling.local
 #
 # Host:
 #   rolling.local
+#
+# Kubernetes:
+#   K3s
+#
+# IMPORTANTE:
+#   kubectl é executado com sudo porque o kubeconfig do K3s está em:
+#   /etc/rancher/k3s/k3s.yaml
+#
 # =============================================================================
 
 name: CD - Rolling Update
@@ -46,6 +52,8 @@ env:
   EC2_USER: ec2-user
   EC2_HOST: ${{ vars.EC2_PUBLIC_IP }}
 
+  KUBECTL: sudo /usr/local/bin/kubectl
+
   NAMESPACE: rolling
   APP_NAME: app-go
   ROLLING_HOST: rolling.local
@@ -55,6 +63,7 @@ jobs:
   # ===========================================================================
   # BUILD + PUSH
   # ===========================================================================
+
   build-and-push:
     name: Build & Push
     runs-on: ubuntu-latest
@@ -65,12 +74,14 @@ jobs:
       # -----------------------------------------------------------------------
       # Checkout
       # -----------------------------------------------------------------------
+
       - name: Checkout
         uses: actions/checkout@v4
 
       # -----------------------------------------------------------------------
       # Login GHCR
       # -----------------------------------------------------------------------
+
       - name: Login GHCR
         uses: docker/login-action@v3
         with:
@@ -79,14 +90,16 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # -----------------------------------------------------------------------
-      # Setup Buildx
+      # Buildx
       # -----------------------------------------------------------------------
+
       - name: Setup Buildx
         uses: docker/setup-buildx-action@v3
 
       # -----------------------------------------------------------------------
       # Build + Push
       # -----------------------------------------------------------------------
+
       - name: Build & Push
         uses: docker/build-push-action@v6
         with:
@@ -97,6 +110,7 @@ jobs:
       # -----------------------------------------------------------------------
       # Resumo
       # -----------------------------------------------------------------------
+
       - name: Resumo do build
         run: |
           {
@@ -110,6 +124,7 @@ jobs:
   # ===========================================================================
   # DEPLOY
   # ===========================================================================
+
   deploy:
     name: Rolling deploy
     needs: build-and-push
@@ -121,33 +136,37 @@ jobs:
       # -----------------------------------------------------------------------
       # Checkout
       # -----------------------------------------------------------------------
+
       - name: Checkout
         uses: actions/checkout@v4
 
       # -----------------------------------------------------------------------
-      # Validar IP da EC2
+      # Validar configuração
       # -----------------------------------------------------------------------
+
       - name: Validar configuração da EC2
         run: |
           if [ -z "${EC2_HOST}" ]; then
             echo "ERRO: EC2_PUBLIC_IP não está configurada."
             echo ""
-            echo "Configure em:"
+            echo "Configure:"
             echo "Settings → Environments → aws → Variables"
             exit 1
           fi
 
-          echo "EC2 configurada."
-          echo "Host: ${ROLLING_HOST}"
+          echo "EC2: ${EC2_HOST}"
+          echo "Host Rolling: ${ROLLING_HOST}"
 
       # -----------------------------------------------------------------------
-      # Configurar chave SSH
+      # SSH
       # -----------------------------------------------------------------------
+
       - name: Configurar chave SSH
         run: |
           mkdir -p ~/.ssh
 
-          printf '%s\n' '${{ secrets.EC2_SSH_KEY }}' > ~/.ssh/deploy_key
+          printf '%s\n' '${{ secrets.EC2_SSH_KEY }}' \
+            > ~/.ssh/deploy_key
 
           chmod 600 ~/.ssh/deploy_key
 
@@ -157,8 +176,9 @@ jobs:
             > /dev/null
 
       # -----------------------------------------------------------------------
-      # Renderizar imagem no Deployment
+      # Renderizar Deployment
       # -----------------------------------------------------------------------
+
       - name: Renderizar Deployment
         run: |
           set -e
@@ -173,8 +193,9 @@ jobs:
           grep -n "image:" k8s/rolling/deployment.yaml
 
       # -----------------------------------------------------------------------
-      # Validar YAML antes de enviar para a EC2
+      # Validar YAML
       # -----------------------------------------------------------------------
+
       - name: Validar YAML dos manifests
         run: |
           ruby -e '
@@ -183,7 +204,7 @@ jobs:
             files = Dir["k8s/rolling/*.yaml"].sort
 
             if files.empty?
-              abort "Nenhum manifest encontrado em k8s/rolling/"
+              abort "Nenhum manifest encontrado."
             end
 
             files.each do |file|
@@ -207,6 +228,7 @@ jobs:
       # -----------------------------------------------------------------------
       # Testar SSH
       # -----------------------------------------------------------------------
+
       - name: Testar conexão SSH
         run: |
           ssh \
@@ -217,8 +239,9 @@ jobs:
             'echo "SSH OK"'
 
       # -----------------------------------------------------------------------
-      # Preparar diretório remoto
+      # Preparar diretório
       # -----------------------------------------------------------------------
+
       - name: Preparar diretório na EC2
         run: |
           ssh \
@@ -230,6 +253,7 @@ jobs:
       # -----------------------------------------------------------------------
       # Copiar manifests
       # -----------------------------------------------------------------------
+
       - name: Copiar manifests
         run: |
           scp \
@@ -239,63 +263,65 @@ jobs:
             "${{ env.EC2_USER }}@${{ env.EC2_HOST }}:/home/ec2-user/rolling/"
 
       # -----------------------------------------------------------------------
-      # Validar acesso ao Kubernetes
+      # Validar K3s
       # -----------------------------------------------------------------------
-      - name: Validar acesso ao Kubernetes
+
+      - name: Validar acesso ao K3s
         run: |
           ssh \
             -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
             "${{ env.EC2_USER }}@${{ env.EC2_HOST }}" \
-            'kubectl version --client && kubectl get nodes -o wide'
+            'sudo /usr/local/bin/kubectl get nodes -o wide'
 
       # -----------------------------------------------------------------------
       # Garantir namespace
       # -----------------------------------------------------------------------
+
       - name: Garantir namespace rolling
         run: |
           ssh \
             -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
             "${{ env.EC2_USER }}@${{ env.EC2_HOST }}" \
-            'kubectl get namespace rolling >/dev/null 2>&1 || kubectl create namespace rolling'
+            'sudo /usr/local/bin/kubectl get namespace rolling >/dev/null 2>&1 ||
+             sudo /usr/local/bin/kubectl create namespace rolling'
 
       # -----------------------------------------------------------------------
-      # Criar / atualizar imagePullSecret
+      # Criar imagePullSecret
       # -----------------------------------------------------------------------
+
       - name: Criar imagePullSecret
         run: |
           ssh \
             -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
             "${{ env.EC2_USER }}@${{ env.EC2_HOST }}" \
-            "kubectl -n rolling create secret docker-registry ghcr-secret \
+            "sudo /usr/local/bin/kubectl -n rolling create secret docker-registry ghcr-secret \
               --docker-server=ghcr.io \
               --docker-username='${{ github.actor }}' \
               --docker-password='${{ secrets.GITHUB_TOKEN }}' \
               --dry-run=client \
-              -o yaml | kubectl apply -f -"
+              -o yaml | sudo /usr/local/bin/kubectl apply -f -"
 
       # -----------------------------------------------------------------------
-      # Dry-run contra a API do Kubernetes
+      # Dry-run
       # -----------------------------------------------------------------------
-      # IMPORTANTE:
-      # Nenhum recurso é alterado nesta etapa.
-      # Se houver erro no manifest, o deploy para aqui.
-      # -----------------------------------------------------------------------
+
       - name: Validar manifests no Kubernetes
         run: |
           ssh \
             -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
             "${{ env.EC2_USER }}@${{ env.EC2_HOST }}" \
-            'kubectl apply \
+            'sudo /usr/local/bin/kubectl apply \
               --dry-run=server \
               -f /home/ec2-user/rolling/'
 
       # -----------------------------------------------------------------------
-      # Aplicar PostgreSQL
+      # PostgreSQL
       # -----------------------------------------------------------------------
+
       - name: Aplicar PostgreSQL
         run: |
           ssh \
@@ -304,22 +330,23 @@ jobs:
             "${{ env.EC2_USER }}@${{ env.EC2_HOST }}" \
             'set -e
 
-             kubectl apply \
+             sudo /usr/local/bin/kubectl apply \
                -f /home/ec2-user/rolling/postgres-secret.yaml
 
-             kubectl apply \
+             sudo /usr/local/bin/kubectl apply \
                -f /home/ec2-user/rolling/postgres-service.yaml
 
-             kubectl apply \
+             sudo /usr/local/bin/kubectl apply \
                -f /home/ec2-user/rolling/postgres-statefulset.yaml
 
-             kubectl -n rolling \
+             sudo /usr/local/bin/kubectl -n rolling \
                rollout status statefulset/postgres \
                --timeout=180s'
 
       # -----------------------------------------------------------------------
-      # Aplicar aplicação
+      # Aplicação
       # -----------------------------------------------------------------------
+
       - name: Aplicar app + RBAC
         run: |
           ssh \
@@ -328,25 +355,26 @@ jobs:
             "${{ env.EC2_USER }}@${{ env.EC2_HOST }}" \
             'set -e
 
-             kubectl apply \
+             sudo /usr/local/bin/kubectl apply \
                -f /home/ec2-user/rolling/rbac.yaml
 
-             kubectl apply \
+             sudo /usr/local/bin/kubectl apply \
                -f /home/ec2-user/rolling/deployment.yaml
 
-             kubectl apply \
+             sudo /usr/local/bin/kubectl apply \
                -f /home/ec2-user/rolling/service.yaml
 
-             kubectl apply \
+             sudo /usr/local/bin/kubectl apply \
                -f /home/ec2-user/rolling/ingress.yaml
 
-             kubectl -n rolling \
+             sudo /usr/local/bin/kubectl -n rolling \
                rollout status deployment/app-go \
                --timeout=180s'
 
       # -----------------------------------------------------------------------
-      # Diagnóstico em caso de falha
+      # Diagnóstico
       # -----------------------------------------------------------------------
+
       - name: Diagnóstico
         if: failure()
         run: |
@@ -359,51 +387,48 @@ jobs:
              echo "================================================="
              echo "NODES"
              echo "================================================="
-             kubectl get nodes -o wide
+             sudo /usr/local/bin/kubectl get nodes -o wide
 
              echo "================================================="
              echo "PODS"
              echo "================================================="
-             kubectl -n rolling get pods -o wide
+             sudo /usr/local/bin/kubectl -n rolling get pods -o wide
 
              echo "================================================="
              echo "DEPLOYMENT"
              echo "================================================="
-             kubectl -n rolling get deployment app-go -o wide
+             sudo /usr/local/bin/kubectl -n rolling \
+               get deployment app-go -o wide
 
              echo "================================================="
              echo "SERVICE"
              echo "================================================="
-             kubectl -n rolling get service app-go -o wide
+             sudo /usr/local/bin/kubectl -n rolling \
+               get service app-go -o wide
 
              echo "================================================="
              echo "ENDPOINTS"
              echo "================================================="
-             kubectl -n rolling get endpoints app-go -o wide
+             sudo /usr/local/bin/kubectl -n rolling \
+               get endpoints app-go -o wide
 
              echo "================================================="
              echo "INGRESS"
              echo "================================================="
-             kubectl -n rolling get ingress app-go -o yaml
+             sudo /usr/local/bin/kubectl -n rolling \
+               get ingress app-go -o yaml
 
              echo "================================================="
              echo "EVENTS"
              echo "================================================="
-             kubectl -n rolling get events \
+             sudo /usr/local/bin/kubectl -n rolling \
+               get events \
                --sort-by=.lastTimestamp'
 
       # -----------------------------------------------------------------------
-      # Smoke test via Ingress
+      # Smoke test
       # -----------------------------------------------------------------------
-      # IP dinâmico:
-      #   ${{ vars.EC2_PUBLIC_IP }}
-      #
-      # Host:
-      #   rolling.local
-      #
-      # Endpoint:
-      #   /healthz
-      # -----------------------------------------------------------------------
+
       - name: Smoke test via rolling.local
         run: |
           echo "================================================="
@@ -444,11 +469,13 @@ jobs:
           echo "IP:   ${{ env.EC2_HOST }}"
           echo "Host: ${{ env.ROLLING_HOST }}"
           echo "Path: /healthz"
+
           exit 1
 
       # -----------------------------------------------------------------------
       # Resumo
       # -----------------------------------------------------------------------
+
       - name: Resumo do deploy
         if: success()
         run: |
