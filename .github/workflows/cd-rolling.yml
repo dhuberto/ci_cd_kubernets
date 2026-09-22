@@ -1,29 +1,37 @@
 # =============================================================================
 # CD - Rolling Update
 # =============================================================================
+#
 # Fluxo:
-#   1. Build + push da imagem para o GHCR
-#   2. SSH na EC2
-#   3. Renderiza o Deployment com a imagem
-#   4. Valida os manifests YAML
-#   5. Copia os manifests
-#   6. Valida acesso ao K3s
-#   7. Cria/atualiza imagePullSecret
-#   8. Valida manifests com dry-run
-#   9. Aplica PostgreSQL
-#  10. Aplica RBAC + Deployment + Service + Ingress
-#  11. Aguarda rollout
-#  12. Smoke test via rolling.local
 #
-# Host:
-#   rolling.local
-#
-# Kubernetes:
+#   GitHub Actions
+#        |
+#        v
+#   Build da aplicação
+#        |
+#        v
+#   Push GHCR
+#        |
+#        v
+#   SSH EC2
+#        |
+#        v
 #   K3s
-#
-# IMPORTANTE:
-#   kubectl é executado com sudo porque o kubeconfig do K3s está em:
-#   /etc/rancher/k3s/k3s.yaml
+#        |
+#        v
+#   PostgreSQL
+#        |
+#        v
+#   Deployment Rolling
+#        |
+#        v
+#   Service
+#        |
+#        v
+#   Ingress
+#        |
+#        v
+#   rolling.local
 #
 # =============================================================================
 
@@ -33,7 +41,7 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Tag da imagem (deixe 'latest' para usar o SHA do commit)"
+        description: "Tag da imagem (latest = SHA do commit)"
         required: true
         default: latest
 
@@ -47,26 +55,32 @@ concurrency:
 
 env:
   IMAGE_TAG: ${{ inputs.image_tag == 'latest' && github.sha || inputs.image_tag }}
+
   IMAGE_NAME: ghcr.io/${{ github.repository }}:${{ inputs.image_tag == 'latest' && github.sha || inputs.image_tag }}
 
   EC2_USER: ec2-user
   EC2_HOST: ${{ vars.EC2_PUBLIC_IP }}
 
-  KUBECTL: sudo /usr/local/bin/kubectl
-
   NAMESPACE: rolling
   APP_NAME: app-go
+
   ROLLING_HOST: rolling.local
+
+  KUBECTL: sudo /usr/local/bin/kubectl
+
+
+# =============================================================================
+# BUILD
+# =============================================================================
 
 jobs:
 
-  # ===========================================================================
-  # BUILD + PUSH
-  # ===========================================================================
-
   build-and-push:
+
     name: Build & Push
+
     runs-on: ubuntu-latest
+
     environment: aws
 
     steps:
@@ -78,16 +92,71 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+
       # -----------------------------------------------------------------------
-      # Login GHCR
+      # Go
       # -----------------------------------------------------------------------
 
-      - name: Login GHCR
-        uses: docker/login-action@v3
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          go-version: "1.25"
+          cache: false
+
+
+      # -----------------------------------------------------------------------
+      # Validar aplicação
+      # -----------------------------------------------------------------------
+
+      - name: Validar aplicação
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Validando arquivos..."
+
+          test -f go.mod
+          test -f go.sum
+          test -f Dockerfile
+          test -f src/main.go
+
+          echo "Arquivos da aplicação encontrados."
+
+
+      # -----------------------------------------------------------------------
+      # Dependências Go
+      # -----------------------------------------------------------------------
+
+      - name: Verificar dependências Go
+        run: |
+          set -euo pipefail
+
+          go mod download
+
+          go mod verify
+
+
+      # -----------------------------------------------------------------------
+      # Testes
+      # -----------------------------------------------------------------------
+
+      - name: Testes
+        run: |
+          set -euo pipefail
+
+          go test ./...
+
+
+      # -----------------------------------------------------------------------
+      # Build local
+      # -----------------------------------------------------------------------
+
+      - name: Build Go
+        run: |
+          set -euo pipefail
+
+          go build -o /tmp/app-go ./src
+
 
       # -----------------------------------------------------------------------
       # Buildx
@@ -96,16 +165,33 @@ jobs:
       - name: Setup Buildx
         uses: docker/setup-buildx-action@v3
 
+
+      # -----------------------------------------------------------------------
+      # Login GHCR
+      # -----------------------------------------------------------------------
+
+      - name: Login GHCR
+        uses: docker/login-action@v3
+
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+
       # -----------------------------------------------------------------------
       # Build + Push
       # -----------------------------------------------------------------------
 
       - name: Build & Push
         uses: docker/build-push-action@v6
+
         with:
           context: .
           push: true
-          tags: ${{ env.IMAGE_NAME }}
+
+          tags: |
+            ${{ env.IMAGE_NAME }}
 
       # -----------------------------------------------------------------------
       # Resumo
@@ -114,21 +200,25 @@ jobs:
       - name: Resumo do build
         run: |
           {
-            echo "### Imagem publicada"
+            echo "### Build concluído"
             echo ""
-            echo "- Tag: \`${{ env.IMAGE_TAG }}\`"
-            echo "- Imagem: \`${{ env.IMAGE_NAME }}\`"
+            echo "- Imagem: \`${IMAGE_NAME}\`"
+            echo "- Tag: \`${IMAGE_TAG}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
 
-  # ===========================================================================
-  # DEPLOY
-  # ===========================================================================
+# =============================================================================
+# DEPLOY
+# =============================================================================
 
   deploy:
-    name: Rolling deploy
+
+    name: Rolling Deploy
+
     needs: build-and-push
+
     runs-on: ubuntu-latest
+
     environment: aws
 
     steps:
@@ -140,22 +230,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+
       # -----------------------------------------------------------------------
-      # Validar configuração
+      # Validar variáveis
       # -----------------------------------------------------------------------
 
-      - name: Validar configuração da EC2
+      - name: Validar configuração
+        shell: bash
         run: |
-          if [ -z "${EC2_HOST}" ]; then
-            echo "ERRO: EC2_PUBLIC_IP não está configurada."
-            echo ""
-            echo "Configure:"
-            echo "Settings → Environments → aws → Variables"
-            exit 1
-          fi
+          set -euo pipefail
 
-          echo "EC2: ${EC2_HOST}"
-          echo "Host Rolling: ${ROLLING_HOST}"
+          test -n "${EC2_HOST}"
+
+          echo "EC2_HOST=${EC2_HOST}"
+          echo "EC2_USER=${EC2_USER}"
+          echo "NAMESPACE=${NAMESPACE}"
+          echo "APP_NAME=${APP_NAME}"
+          echo "ROLLING_HOST=${ROLLING_HOST}"
+          echo "IMAGE_NAME=${IMAGE_NAME}"
+
 
       # -----------------------------------------------------------------------
       # SSH
@@ -163,6 +256,8 @@ jobs:
 
       - name: Configurar chave SSH
         run: |
+          set -euo pipefail
+
           mkdir -p ~/.ssh
 
           printf '%s\n' '${{ secrets.EC2_SSH_KEY }}' \
@@ -175,37 +270,100 @@ jobs:
             -f ~/.ssh/deploy_key \
             > /dev/null
 
+          echo "Chave SSH válida."
+
+
+      # -----------------------------------------------------------------------
+      # Testar SSH
+      # -----------------------------------------------------------------------
+
+      - name: Testar SSH
+        run: |
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=10 \
+            "${EC2_USER}@${EC2_HOST}" \
+            'echo "SSH OK"'
+
+
       # -----------------------------------------------------------------------
       # Renderizar Deployment
       # -----------------------------------------------------------------------
 
       - name: Renderizar Deployment
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          test -f k8s/rolling/deployment.yaml
+          FILE="k8s/rolling/deployment.yaml"
+
+          test -f "$FILE"
+
+          echo "==============================================="
+          echo "VALIDANDO DEPLOYMENT"
+          echo "==============================================="
+
+          if ! grep -q 'IMAGE_PLACEHOLDER' "$FILE"; then
+
+            echo "ERRO: IMAGE_PLACEHOLDER não encontrado."
+
+            echo ""
+            echo "Arquivo atual:"
+            cat "$FILE"
+
+            exit 1
+          fi
+
+          echo "IMAGE_PLACEHOLDER encontrado."
+
+          echo ""
+          echo "Imagem:"
+          echo "${IMAGE_NAME}"
 
           sed -i \
-            "s|IMAGE_PLACEHOLDER|${{ env.IMAGE_NAME }}|g" \
-            k8s/rolling/deployment.yaml
+            "s|IMAGE_PLACEHOLDER|${IMAGE_NAME}|g" \
+            "$FILE"
 
-          echo "Imagem utilizada:"
-          grep -n "image:" k8s/rolling/deployment.yaml
+          echo ""
+          echo "==============================================="
+          echo "DEPLOYMENT RENDERIZADO"
+          echo "==============================================="
+
+          grep -n 'image:' "$FILE"
+
+          echo ""
+          echo "Validando imagem..."
+
+          if grep -q 'IMAGE_PLACEHOLDER' "$FILE"; then
+            echo "ERRO: placeholder ainda existe."
+            exit 1
+          fi
+
+          if ! grep -q "${IMAGE_NAME}" "$FILE"; then
+            echo "ERRO: imagem esperada não encontrada."
+            exit 1
+          fi
+
+          echo ""
+          echo "Renderização OK."
+
 
       # -----------------------------------------------------------------------
       # Validar YAML
       # -----------------------------------------------------------------------
 
-      - name: Validar YAML dos manifests
+      - name: Validar YAML
+        shell: bash
         run: |
+          set -euo pipefail
+
           ruby -e '
             require "yaml"
 
             files = Dir["k8s/rolling/*.yaml"].sort
 
-            if files.empty?
-              abort "Nenhum manifest encontrado."
-            end
+            abort "Nenhum manifest encontrado." if files.empty?
 
             files.each do |file|
               puts "Validando #{file}"
@@ -213,42 +371,28 @@ jobs:
               begin
                 YAML.load_stream(File.read(file))
               rescue Psych::Exception => e
-                warn ""
-                warn "ERRO DE YAML:"
-                warn file
+                warn "ERRO YAML: #{file}"
                 warn e.message
                 exit 1
               end
             end
 
-            puts ""
             puts "Todos os manifests YAML estão válidos."
           '
 
+
       # -----------------------------------------------------------------------
-      # Testar SSH
+      # Preparar diretório remoto
       # -----------------------------------------------------------------------
 
-      - name: Testar conexão SSH
+      - name: Preparar diretório remoto
         run: |
           ssh \
             -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
-            -o ConnectTimeout=10 \
-            "${{ env.EC2_USER }}@${{ env.EC2_HOST }}" \
-            'echo "SSH OK"'
-
-      # -----------------------------------------------------------------------
-      # Preparar diretório
-      # -----------------------------------------------------------------------
-
-      - name: Preparar diretório na EC2
-        run: |
-          ssh \
-            -i ~/.ssh/deploy_key \
-            -o StrictHostKeyChecking=no \
-            "${{ env.EC2_USER }}@${{ env.EC2_HOST }}" \
+            "${EC2_USER}@${EC2_HOST}" \
             'mkdir -p /home/ec2-user/rolling'
+
 
       # -----------------------------------------------------------------------
       # Copiar manifests
@@ -260,35 +404,38 @@ jobs:
             -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
             k8s/rolling/*.yaml \
-            "${{ env.EC2_USER }}@${{ env.EC2_HOST }}:/home/ec2-user/rolling/"
+            "${EC2_USER}@${EC2_HOST}:/home/ec2-user/rolling/"
+
 
       # -----------------------------------------------------------------------
       # Validar K3s
       # -----------------------------------------------------------------------
 
-      - name: Validar acesso ao K3s
+      - name: Validar K3s
         run: |
           ssh \
             -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
-            "${{ env.EC2_USER }}@${{ env.EC2_HOST }}" \
+            "${EC2_USER}@${EC2_HOST}" \
             'sudo /usr/local/bin/kubectl get nodes -o wide'
 
+
       # -----------------------------------------------------------------------
-      # Garantir namespace
+      # Namespace
       # -----------------------------------------------------------------------
 
-      - name: Garantir namespace rolling
+      - name: Garantir namespace
         run: |
           ssh \
             -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
-            "${{ env.EC2_USER }}@${{ env.EC2_HOST }}" \
+            "${EC2_USER}@${EC2_HOST}" \
             'sudo /usr/local/bin/kubectl get namespace rolling >/dev/null 2>&1 ||
              sudo /usr/local/bin/kubectl create namespace rolling'
 
+
       # -----------------------------------------------------------------------
-      # Criar imagePullSecret
+      # GHCR Secret
       # -----------------------------------------------------------------------
 
       - name: Criar imagePullSecret
@@ -296,7 +443,7 @@ jobs:
           ssh \
             -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
-            "${{ env.EC2_USER }}@${{ env.EC2_HOST }}" \
+            "${EC2_USER}@${EC2_HOST}" \
             "sudo /usr/local/bin/kubectl -n rolling create secret docker-registry ghcr-secret \
               --docker-server=ghcr.io \
               --docker-username='${{ github.actor }}' \
@@ -304,8 +451,9 @@ jobs:
               --dry-run=client \
               -o yaml | sudo /usr/local/bin/kubectl apply -f -"
 
+
       # -----------------------------------------------------------------------
-      # Dry-run
+      # Dry Run Kubernetes
       # -----------------------------------------------------------------------
 
       - name: Validar manifests no Kubernetes
@@ -313,10 +461,11 @@ jobs:
           ssh \
             -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
-            "${{ env.EC2_USER }}@${{ env.EC2_HOST }}" \
+            "${EC2_USER}@${EC2_HOST}" \
             'sudo /usr/local/bin/kubectl apply \
               --dry-run=server \
               -f /home/ec2-user/rolling/'
+
 
       # -----------------------------------------------------------------------
       # PostgreSQL
@@ -327,7 +476,7 @@ jobs:
           ssh \
             -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
-            "${{ env.EC2_USER }}@${{ env.EC2_HOST }}" \
+            "${EC2_USER}@${EC2_HOST}" \
             'set -e
 
              sudo /usr/local/bin/kubectl apply \
@@ -343,36 +492,80 @@ jobs:
                rollout status statefulset/postgres \
                --timeout=180s'
 
+
       # -----------------------------------------------------------------------
-      # Aplicação
+      # RBAC
       # -----------------------------------------------------------------------
 
-      - name: Aplicar app + RBAC
+      - name: Aplicar RBAC
         run: |
           ssh \
             -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
-            "${{ env.EC2_USER }}@${{ env.EC2_HOST }}" \
-            'set -e
+            "${EC2_USER}@${EC2_HOST}" \
+            'sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/rolling/rbac.yaml'
 
-             sudo /usr/local/bin/kubectl apply \
-               -f /home/ec2-user/rolling/rbac.yaml
-
-             sudo /usr/local/bin/kubectl apply \
-               -f /home/ec2-user/rolling/deployment.yaml
-
-             sudo /usr/local/bin/kubectl apply \
-               -f /home/ec2-user/rolling/service.yaml
-
-             sudo /usr/local/bin/kubectl apply \
-               -f /home/ec2-user/rolling/ingress.yaml
-
-             sudo /usr/local/bin/kubectl -n rolling \
-               rollout status deployment/app-go \
-               --timeout=180s'
 
       # -----------------------------------------------------------------------
-      # Diagnóstico
+      # Deployment
+      # -----------------------------------------------------------------------
+
+      - name: Aplicar Deployment
+        run: |
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            "${EC2_USER}@${EC2_HOST}" \
+            'sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/rolling/deployment.yaml'
+
+
+      # -----------------------------------------------------------------------
+      # Service
+      # -----------------------------------------------------------------------
+
+      - name: Aplicar Service
+        run: |
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            "${EC2_USER}@${EC2_HOST}" \
+            'sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/rolling/service.yaml'
+
+
+      # -----------------------------------------------------------------------
+      # Ingress
+      # -----------------------------------------------------------------------
+
+      - name: Aplicar Ingress
+        run: |
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            "${EC2_USER}@${EC2_HOST}" \
+            'sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/rolling/ingress.yaml'
+
+
+      # -----------------------------------------------------------------------
+      # Rollout
+      # -----------------------------------------------------------------------
+
+      - name: Aguardar Rolling Update
+        run: |
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            "${EC2_USER}@${EC2_HOST}" \
+            'sudo /usr/local/bin/kubectl -n rolling \
+              rollout status deployment/app-go \
+              --timeout=180s'
+
+
+      # -----------------------------------------------------------------------
+      # Diagnóstico em caso de erro
       # -----------------------------------------------------------------------
 
       - name: Diagnóstico
@@ -381,49 +574,72 @@ jobs:
           ssh \
             -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
-            "${{ env.EC2_USER }}@${{ env.EC2_HOST }}" \
+            "${EC2_USER}@${EC2_HOST}" \
             'set +e
 
              echo "================================================="
              echo "NODES"
              echo "================================================="
+
              sudo /usr/local/bin/kubectl get nodes -o wide
+
 
              echo "================================================="
              echo "PODS"
              echo "================================================="
-             sudo /usr/local/bin/kubectl -n rolling get pods -o wide
+
+             sudo /usr/local/bin/kubectl -n rolling \
+               get pods -o wide
+
 
              echo "================================================="
              echo "DEPLOYMENT"
              echo "================================================="
+
              sudo /usr/local/bin/kubectl -n rolling \
                get deployment app-go -o wide
+
+
+             echo "================================================="
+             echo "REPLICASETS"
+             echo "================================================="
+
+             sudo /usr/local/bin/kubectl -n rolling \
+               get replicasets -o wide
+
 
              echo "================================================="
              echo "SERVICE"
              echo "================================================="
+
              sudo /usr/local/bin/kubectl -n rolling \
                get service app-go -o wide
+
 
              echo "================================================="
              echo "ENDPOINTS"
              echo "================================================="
+
              sudo /usr/local/bin/kubectl -n rolling \
                get endpoints app-go -o wide
+
 
              echo "================================================="
              echo "INGRESS"
              echo "================================================="
+
              sudo /usr/local/bin/kubectl -n rolling \
                get ingress app-go -o yaml
+
 
              echo "================================================="
              echo "EVENTS"
              echo "================================================="
+
              sudo /usr/local/bin/kubectl -n rolling \
                get events \
                --sort-by=.lastTimestamp'
+
 
       # -----------------------------------------------------------------------
       # Smoke test
@@ -431,12 +647,16 @@ jobs:
 
       - name: Smoke test via rolling.local
         run: |
+          set -euo pipefail
+
           echo "================================================="
           echo "SMOKE TEST"
           echo "================================================="
-          echo "IP:   ${{ env.EC2_HOST }}"
-          echo "Host: ${{ env.ROLLING_HOST }}"
+
+          echo "IP:   ${EC2_HOST}"
+          echo "Host: ${ROLLING_HOST}"
           echo "Path: /healthz"
+
           echo "================================================="
 
           for i in $(seq 1 20); do
@@ -447,17 +667,20 @@ jobs:
               -w "%{http_code}" \
               --connect-timeout 5 \
               --max-time 10 \
-              -H "Host: ${{ env.ROLLING_HOST }}" \
-              "http://${{ env.EC2_HOST }}/healthz" \
+              -H "Host: ${ROLLING_HOST}" \
+              "http://${EC2_HOST}/healthz" \
               || true)
 
             if [ "$code" = "200" ]; then
+
               echo ""
-              echo "Smoke OK (tentativa $i)"
+              echo "Smoke OK."
+              echo "Tentativa: ${i}"
+
               exit 0
             fi
 
-            echo "tentativa $i/20 — HTTP $code"
+            echo "tentativa ${i}/20 — HTTP ${code}"
 
             sleep 5
           done
@@ -466,26 +689,28 @@ jobs:
           echo "================================================="
           echo "SMOKE TEST FALHOU"
           echo "================================================="
-          echo "IP:   ${{ env.EC2_HOST }}"
-          echo "Host: ${{ env.ROLLING_HOST }}"
+
+          echo "IP:   ${EC2_HOST}"
+          echo "Host: ${ROLLING_HOST}"
           echo "Path: /healthz"
 
           exit 1
+
 
       # -----------------------------------------------------------------------
       # Resumo
       # -----------------------------------------------------------------------
 
-      - name: Resumo do deploy
+      - name: Resumo
         if: success()
         run: |
           {
             echo "### Rolling deploy concluído"
             echo ""
-            echo "- Imagem: \`${{ env.IMAGE_NAME }}\`"
-            echo "- Namespace: \`${{ env.NAMESPACE }}\`"
-            echo "- Deployment: \`${{ env.APP_NAME }}\`"
-            echo "- Host: \`${{ env.ROLLING_HOST }}\`"
-            echo "- IP: \`${{ env.EC2_HOST }}\`"
+            echo "- Imagem: \`${IMAGE_NAME}\`"
+            echo "- Namespace: \`${NAMESPACE}\`"
+            echo "- Deployment: \`${APP_NAME}\`"
+            echo "- Host: \`${ROLLING_HOST}\`"
+            echo "- IP: \`${EC2_HOST}\`"
             echo "- Smoke test: **OK**"
           } >> "$GITHUB_STEP_SUMMARY"
