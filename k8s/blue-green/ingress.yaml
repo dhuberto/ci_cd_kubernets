@@ -1,23 +1,36 @@
 # =============================================================================
-# ingress.yaml — Ingress do Blue/Green (cor ativa)
+# ingress.yaml — Ingress Blue/Green ativo
 # =============================================================================
-# Host: app-go.local
-# Backend: Service app-go-active (selector trocável pelo switch).
-# IngressClass: traefik (padrão do K3s).
+# Host:
+#   app-go.local
+#
+# Fluxo:
+#
+#   app-go.local
+#       ↓
+#   app-go-active
+#       ↓
+#   slot=blue OU slot=green
 # =============================================================================
+
 apiVersion: networking.k8s.io/v1
 kind: Ingress
+
 metadata:
   name: app-go
   namespace: blue-green
+
 spec:
   ingressClassName: traefik
+
   rules:
     - host: app-go.local
+
       http:
         paths:
           - path: /
             pathType: Prefix
+
             backend:
               service:
                 name: app-go-active
