@@ -1,15 +1,29 @@
 ---
 # =============================================================================
-# playbook.yml — instala K3s na EC2 e prepara os namespaces
+# playbook.yml — prepara EC2 para K3s
 # =============================================================================
-# O K3s já traz embutido:
-#   - containerd (runtime de container)
-#   - kubectl (via `k3s kubectl` ou symlink em /usr/local/bin/kubectl)
-#   - Traefik (Ingress Controller padrão)
-#   - local-path provisioner (StorageClass padrão)
 #
-# Não é necessário instalar Docker, kind, kubectl nem ingress-nginx.
+# Responsabilidades:
+#   1. Instalar K3s Server
+#   2. Garantir K3s ativo
+#   3. Configurar kubeconfig para ec2-user
+#   4. Disponibilizar kubectl para ec2-user
+#   5. Criar namespaces da aplicação
+#   6. Validar o cluster
+#
+# O K3s fornece:
+#   - containerd
+#   - kubectl via k3s kubectl
+#   - Traefik
+#   - local-path-provisioner
+#
+# Hosts da aplicação são responsabilidade dos Ingresses:
+#   - rolling.local
+#   - app-go.local
+#   - app-go-azul.local
+#   - app-go-verde.local
 # =============================================================================
+
 - name: Configurar EC2 para o cluster K3s
   hosts: all
   gather_facts: true
@@ -17,15 +31,18 @@
 
   vars:
     k3s_version: "v1.31.5+k3s1"
+
     namespaces:
       - rolling
       - blue-green
 
   tasks:
+
     # =========================================================================
-    # 1) Instalar K3s Server (single-node)
+    # 1. K3s
     # =========================================================================
-    - name: Verificar se o K3s já está instalado
+
+    - name: Verificar se K3s já está instalado
       stat:
         path: /usr/local/bin/k3s
       register: k3s_bin
@@ -48,14 +65,22 @@
 
     - name: Aguardar o nó ficar Ready
       become: true
-      shell: |
-        k3s kubectl wait --for=condition=Ready node --all --timeout=180s
+      command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - wait
+          - --for=condition=Ready
+          - node
+          - --all
+          - --timeout=180s
       changed_when: false
 
     # =========================================================================
-    # 2) Preparar o kubeconfig para o ec2-user
+    # 2. Kubeconfig do ec2-user
     # =========================================================================
-    - name: Criar diretório .kube do ec2-user
+
+    - name: Criar diretório .kube
       file:
         path: /home/ec2-user/.kube
         state: directory
@@ -63,7 +88,7 @@
         group: ec2-user
         mode: "0700"
 
-    - name: Copiar kubeconfig do K3s para o ec2-user
+    - name: Copiar kubeconfig do K3s
       become: true
       copy:
         src: /etc/rancher/k3s/k3s.yaml
@@ -74,20 +99,27 @@
         mode: "0600"
 
     - name: Descobrir IP privado da EC2
-      shell: hostname -I | awk '{print $1}'
-      register: private_ip
+      command:
+        cmd: hostname -I
+      register: hostname_ips
       changed_when: false
 
-    - name: Substituir 127.0.0.1 pelo IP privado no kubeconfig
+    - name: Definir IP privado
+      set_fact:
+        private_ip: "{{ hostname_ips.stdout.split()[0] }}"
+
+    - name: Configurar endpoint do kubeconfig
+      become: true
       replace:
         path: /home/ec2-user/.kube/config
-        regexp: '127\.0\.0\.1'
-        replace: "{{ private_ip.stdout }}"
+        regexp: 'https://127\.0\.0\.1:6443'
+        replace: 'https://{{ private_ip }}:6443'
 
     # =========================================================================
-    # 3) Criar symlink do kubectl
+    # 3. kubectl
     # =========================================================================
-    - name: Criar symlink do kubectl
+
+    - name: Criar symlink kubectl
       become: true
       file:
         src: /usr/local/bin/k3s
@@ -95,28 +127,35 @@
         state: link
         force: true
 
-    # =========================================================================
-    # 4) Criar namespaces do lab
-    # =========================================================================
-    - name: Criar namespaces do lab
-      become: true
-      command: k3s kubectl create ns {{ item }}
-      register: ns_create
-      failed_when: >
-        ns_create.rc != 0 and
-        'already exists' not in (ns_create.stderr | default(''))
-      changed_when: ns_create.rc == 0
-      loop: "{{ namespaces }}"
-
-    # =========================================================================
-    # 5) Log final
-    # =========================================================================
-    - name: Mostrar nodes
-      become: true
-      command: k3s kubectl get nodes -o wide
-      register: nodes_out
+    - name: Garantir acesso do ec2-user ao kubectl
+      command:
+        cmd: /usr/local/bin/kubectl version --client
+      environment:
+        KUBECONFIG: /home/ec2-user/.kube/config
       changed_when: false
 
-    - name: Output nodes
-      debug:
-        msg: "{{ nodes_out.stdout_lines }}"
+    - name: Validar acesso do ec2-user ao cluster
+      command:
+        cmd: /usr/local/bin/kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: /home/ec2-user/.kube/config
+      become: false
+      become_user: ec2-user
+      register: nodes_check
+      changed_when: false
+
+    # =========================================================================
+    # 4. Namespaces
+    # =========================================================================
+
+    - name: Criar namespaces da aplicação
+      command:
+        cmd: /usr/local/bin/kubectl create namespace {{ item }}
+      environment:
+        KUBECONFIG: /home/ec2-user/.kube/config
+      register: namespace_result
+      failed_when:
+        - namespace_result.rc != 0
+        - "'AlreadyExists' not in (namespace_result.stderr | default(''))"
+      changed_when: namespace_result.rc == 0
+      loop: "{{
