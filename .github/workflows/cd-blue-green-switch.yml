@@ -2,7 +2,7 @@
 # CD - Blue/Green (switch de tráfego)
 # =============================================================================
 # Faz o cutover alterando somente o selector do Service app-go-active.
-# Hosts: app-go.local | app-go-azul.local | app-go-verde.local
+# Hosts: rolling.local | app-go.local | app-go-azul.local | app-go-verde.local
 # =============================================================================
 
 name: CD - Blue/Green (switch de tráfego)
@@ -102,9 +102,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Alterando tráfego para: ${{
-            inputs.color
-          }}"
+          COLOR="${{ inputs.color }}"
+
+          echo "Alterando tráfego para: ${COLOR}"
 
           ssh \
             -i ~/.ssh/deploy_key \
@@ -114,7 +114,7 @@ jobs:
               -n ${NAMESPACE} \
               patch svc ${ACTIVE_SERVICE} \
               --type=merge \
-              -p '{\"spec\":{\"selector\":{\"app\":\"app-go\",\"slot\":\"${{ inputs.color }}\"}}}'"
+              -p '{\"spec\":{\"selector\":{\"app\":\"app-go\",\"slot\":\"${COLOR}\"}}}'"
 
           echo ""
           echo "Switch aplicado."
@@ -124,6 +124,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          COLOR="${{ inputs.color }}"
 
           selector=$(ssh \
             -i ~/.ssh/deploy_key \
@@ -137,22 +139,31 @@ jobs:
           echo "Selector atual:"
           echo "${selector}"
 
-          expected='{"app":"app-go","slot":"${{ inputs.color }}"}'
+          expected="{\"app\":\"app-go\",\"slot\":\"${COLOR}\"}"
 
-          if [[ "${selector}" != *"slot=${{ inputs.color }}"* ]]; then
-            echo "ERRO: selector não aponta para ${{ inputs.color }}."
+          echo ""
+          echo "Selector esperado:"
+          echo "${expected}"
+
+          if [ "${selector}" != "${expected}" ]; then
+            echo ""
+            echo "ERRO: selector incorreto."
+            echo "Esperado: ${expected}"
+            echo "Atual:    ${selector}"
             exit 1
           fi
 
+          echo ""
           echo "Selector confirmado."
+          echo "Tráfego direcionado para: ${COLOR}"
 
-      # Verifica endpoints
+      # Endpoints
       - name: Aguardar endpoints da cor
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Aguardando endpoints..."
+          echo "Aguardando endpoints do Service ${ACTIVE_SERVICE}..."
 
           for i in $(seq 1 20); do
 
@@ -167,25 +178,31 @@ jobs:
               || true)
 
             if [ -n "${endpoints}" ]; then
+              echo ""
               echo "Endpoints encontrados:"
               echo "${endpoints}"
               exit 0
             fi
 
-            echo "tentativa ${i}/20 — nenhum endpoint ainda"
+            echo "tentativa ${i}/20 — nenhum endpoint"
 
             sleep 3
           done
 
-          echo "ERRO: Service ${ACTIVE_SERVICE} não possui endpoints."
+          echo ""
+          echo "ERRO: ${ACTIVE_SERVICE} não possui endpoints."
           exit 1
 
       # Diagnóstico
-      - name: Diagnóstico do Service
+      - name: Diagnóstico
         if: failure()
         shell: bash
         run: |
           set +e
+
+          echo "================================================="
+          echo "PODS"
+          echo "================================================="
 
           ssh \
             -i ~/.ssh/deploy_key \
@@ -196,6 +213,8 @@ jobs:
               get pods -o wide"
 
           echo "================================================="
+          echo "SERVICE"
+          echo "================================================="
 
           ssh \
             -i ~/.ssh/deploy_key \
@@ -203,8 +222,10 @@ jobs:
             "${EC2_USER}@${EC2_HOST}" \
             "sudo /usr/local/bin/kubectl \
               -n ${NAMESPACE} \
-              get svc ${ACTIVE_SERVICE} -o wide"
+              get svc ${ACTIVE_SERVICE} -o yaml"
 
+          echo "================================================="
+          echo "ENDPOINTS"
           echo "================================================="
 
           ssh \
@@ -215,6 +236,8 @@ jobs:
               -n ${NAMESPACE} \
               get endpoints ${ACTIVE_SERVICE} -o yaml"
 
+          echo "================================================="
+          echo "INGRESS"
           echo "================================================="
 
           ssh \
@@ -234,10 +257,10 @@ jobs:
           echo "================================================="
           echo "SMOKE TEST BLUE/GREEN"
           echo "================================================="
-          echo "IP:    ${EC2_HOST}"
-          echo "Host:  ${ACTIVE_HOST}"
-          echo "Cor:   ${{ inputs.color }}"
-          echo "Path:  /healthz"
+          echo "IP:   ${EC2_HOST}"
+          echo "Host: ${ACTIVE_HOST}"
+          echo "Path: /healthz"
+          echo "Cor:  ${{ inputs.color }}"
           echo "================================================="
 
           for i in $(seq 1 20); do
@@ -271,8 +294,7 @@ jobs:
           echo "================================================="
           echo "SMOKE TEST FALHOU"
           echo "================================================="
-
-          echo "O switch foi aplicado, mas o Ingress não retornou HTTP 200."
+          echo "Switch aplicado, mas o Ingress não retornou HTTP 200."
 
           exit 1
 
@@ -287,9 +309,16 @@ jobs:
             echo "- Cor ativa: \`${{ inputs.color }}\`"
             echo "- Service: \`${ACTIVE_SERVICE}\`"
             echo "- Selector: \`slot=${{ inputs.color }}\`"
-            echo "- Host: \`${ACTIVE_HOST}\`"
+            echo "- Host ativo: \`${ACTIVE_HOST}\`"
             echo "- IP: \`${EC2_HOST}\`"
             echo "- Smoke test: **OK**"
+            echo ""
+            echo "### Hosts"
+            echo ""
+            echo "- Rolling: \`rolling.local\`"
+            echo "- Blue/Green ativo: \`app-go.local\`"
+            echo "- Blue: \`app-go-azul.local\`"
+            echo "- Green: \`app-go-verde.local\`"
             echo ""
             echo "Rollback: execute novamente escolhendo a cor contrária."
           } >> "$GITHUB_STEP_SUMMARY"
