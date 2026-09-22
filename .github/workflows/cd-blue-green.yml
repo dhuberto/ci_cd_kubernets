@@ -24,6 +24,7 @@ on:
         type: choice
         options: [blue, green]
         required: true
+
       image_tag:
         description: "Tag da imagem (deixe 'latest' para usar o SHA do commit)"
         required: true
@@ -42,10 +43,14 @@ env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}:${{ inputs.image_tag == 'latest' && github.sha || inputs.image_tag }}
 
 jobs:
+  # ===========================================================================
+  # BUILD + PUSH
+  # ===========================================================================
   build-and-push:
     name: Build & Push
     runs-on: ubuntu-latest
     environment: aws
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -67,6 +72,7 @@ jobs:
               'require github.com/lib/pq v1.10.9' \
               > go.mod
           fi
+
           go mod tidy
 
       - name: Setup Buildx
@@ -93,13 +99,17 @@ jobs:
             echo ""
             echo "- Tag: \`${{ env.IMAGE_TAG }}\`"
             echo "- Imagem: \`${{ env.IMAGE_NAME }}\`"
-          } >> $GITHUB_STEP_SUMMARY
+          } >> "$GITHUB_STEP_SUMMARY"
 
+  # ===========================================================================
+  # DEPLOY BLUE/GREEN
+  # ===========================================================================
   deploy:
     name: Deploy na cor ${{ inputs.color }}
     needs: build-and-push
     runs-on: ubuntu-latest
     environment: aws
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -110,16 +120,24 @@ jobs:
           echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
 
+      # -----------------------------------------------------------------------
+      # Renderiza a imagem no deployment da cor selecionada.
+      # -----------------------------------------------------------------------
       - name: Renderizar deployment da cor alvo
         run: |
-          sed -i "s|IMAGE_PLACEHOLDER|${{ env.IMAGE_NAME }}|g" \
-            k8s/blue-green/deployment-${{ inputs.color }}.yaml
+          sed -i \
+            "s|IMAGE_PLACEHOLDER|${{ env.IMAGE_NAME }}|g" \
+            "k8s/blue-green/deployment-${{ inputs.color }}.yaml"
 
-      # Copia os 11 manifestos base + os 2 Ingress dedicados + o deployment da cor.
+      # -----------------------------------------------------------------------
+      # Copia os manifestos para a EC2.
+      # -----------------------------------------------------------------------
       - name: Copiar manifestos base e o da cor
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
-            ec2-user@${{ vars.EC2_PUBLIC_IP }} "mkdir -p ~/blue-green"
+            ec2-user@${{ vars.EC2_PUBLIC_IP }} \
+            "mkdir -p ~/blue-green"
+
           scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             k8s/blue-green/rbac.yaml \
             k8s/blue-green/postgres-secret.yaml \
@@ -131,49 +149,91 @@ jobs:
             k8s/blue-green/ingress.yaml \
             k8s/blue-green/ingress-blue.yaml \
             k8s/blue-green/ingress-green.yaml \
-            k8s/blue-green/deployment-${{ inputs.color }}.yaml \
+            "k8s/blue-green/deployment-${{ inputs.color }}.yaml" \
             ec2-user@${{ vars.EC2_PUBLIC_IP }}:/home/ec2-user/blue-green/
 
+      # -----------------------------------------------------------------------
+      # GHCR Secret
+      # -----------------------------------------------------------------------
       - name: Criar imagePullSecret no namespace blue-green
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             ec2-user@${{ vars.EC2_PUBLIC_IP }} \
-            "/usr/local/bin/kubectl -n blue-green create secret docker-registry ghcr-secret \
-               --docker-server=ghcr.io \
-               --docker-username=${{ github.actor }} \
-               --docker-password=${{ secrets.GITHUB_TOKEN }} \
-               --dry-run=client -o yaml | /usr/local/bin/kubectl apply -f -"
+            "sudo /usr/local/bin/kubectl -n blue-green create secret docker-registry ghcr-secret \
+              --docker-server=ghcr.io \
+              --docker-username=${{ github.actor }} \
+              --docker-password=${{ secrets.GITHUB_TOKEN }} \
+              --dry-run=client -o yaml | \
+              sudo /usr/local/bin/kubectl apply -f -"
 
+      # -----------------------------------------------------------------------
+      # PostgreSQL
+      # -----------------------------------------------------------------------
       - name: Aplicar Postgres do blue-green
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             ec2-user@${{ vars.EC2_PUBLIC_IP }} \
-            '/usr/local/bin/kubectl apply -f /home/ec2-user/blue-green/postgres-secret.yaml && \
-             /usr/local/bin/kubectl apply -f /home/ec2-user/blue-green/postgres-service.yaml && \
-             /usr/local/bin/kubectl apply -f /home/ec2-user/blue-green/postgres-statefulset.yaml && \
-             /usr/local/bin/kubectl -n blue-green rollout status statefulset/postgres --timeout=180s'
+            'sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/blue-green/postgres-secret.yaml && \
+             sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/blue-green/postgres-service.yaml && \
+             sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/blue-green/postgres-statefulset.yaml && \
+             sudo /usr/local/bin/kubectl -n blue-green rollout status \
+              statefulset/postgres --timeout=180s'
 
-      # Aplica RBAC + Services + 3 Ingress (active, blue, green) + Deployment da cor.
-      # O rollout status aponta para app-go-<cor>.
+      # -----------------------------------------------------------------------
+      # Services + Ingress + RBAC + Deployment
+      # -----------------------------------------------------------------------
+      # Aplica:
+      #   - RBAC
+      #   - Service blue
+      #   - Service green
+      #   - Service active
+      #   - Ingress active
+      #   - Ingress blue
+      #   - Ingress green
+      #   - Deployment da cor selecionada
+      #
+      # O rollout status aponta para:
+      #   app-go-blue
+      # ou
+      #   app-go-green
+      # -----------------------------------------------------------------------
       - name: Aplicar base + deployment da cor
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             ec2-user@${{ vars.EC2_PUBLIC_IP }} \
-            '/usr/local/bin/kubectl apply -f /home/ec2-user/blue-green/rbac.yaml && \
-             /usr/local/bin/kubectl apply -f /home/ec2-user/blue-green/service-blue.yaml && \
-             /usr/local/bin/kubectl apply -f /home/ec2-user/blue-green/service-green.yaml && \
-             /usr/local/bin/kubectl apply -f /home/ec2-user/blue-green/service-active.yaml && \
-             /usr/local/bin/kubectl apply -f /home/ec2-user/blue-green/ingress.yaml && \
-             /usr/local/bin/kubectl apply -f /home/ec2-user/blue-green/ingress-blue.yaml && \
-             /usr/local/bin/kubectl apply -f /home/ec2-user/blue-green/ingress-green.yaml && \
-             /usr/local/bin/kubectl apply -f /home/ec2-user/blue-green/deployment-${{ inputs.color }}.yaml && \
-             /usr/local/bin/kubectl -n blue-green rollout status deploy/app-go-${{ inputs.color }} --timeout=180s'
+            'sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/blue-green/rbac.yaml && \
+             sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/blue-green/service-blue.yaml && \
+             sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/blue-green/service-green.yaml && \
+             sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/blue-green/service-active.yaml && \
+             sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/blue-green/ingress.yaml && \
+             sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/blue-green/ingress-blue.yaml && \
+             sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/blue-green/ingress-green.yaml && \
+             sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/blue-green/deployment-${{ inputs.color }}.yaml && \
+             sudo /usr/local/bin/kubectl -n blue-green rollout status \
+              deploy/app-go-${{ inputs.color }} --timeout=180s'
 
-      # Smoke test: aponta para o Service app-go-<cor>.
+      # -----------------------------------------------------------------------
+      # Smoke test
+      # -----------------------------------------------------------------------
+      # Executa um pod temporário dentro do namespace blue-green e testa
+      # diretamente o Service da cor que acabou de receber o deploy.
+      # -----------------------------------------------------------------------
       - name: Smoke test no slot
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             ec2-user@${{ vars.EC2_PUBLIC_IP }} \
-            '/usr/local/bin/kubectl -n blue-green run smoke-${{ inputs.color }} \
-               --rm -i --restart=Never --image=curlimages/curl -- \
-               curl -sf http://app-go-${{ inputs.color }}:5000/healthz'
+            'sudo /usr/local/bin/kubectl -n blue-green run smoke-${{ inputs.color }} \
+              --rm -i --restart=Never \
+              --image=curlimages/curl -- \
+              curl -sf http://app-go-${{ inputs.color }}:5000/healthz'
