@@ -1,21 +1,37 @@
 # =============================================================================
 # service-active.yaml — Service ativo do Blue/Green
 # =============================================================================
-# O switch de tráfego troca APENAS o selector deste Service.
-# O Ingress aponta para ele, e ele aponta para o slot ativo.
+# O Ingress app-go.local aponta para este Service.
+#
+# O workflow cd-blue-green-switch.yml altera SOMENTE:
+#
+#   spec.selector.slot
+#
+# Valores permitidos:
+#
+#   blue
+#   green
+#
+# Não há rollout neste Service.
+# Não há recriação de Pods durante o switch.
 # =============================================================================
+
 apiVersion: v1
 kind: Service
+
 metadata:
   name: app-go-active
   namespace: blue-green
   labels:
     app: app-go
+
 spec:
   type: ClusterIP
+
   selector:
     app: app-go
-    slot: blue          # <- trocado pelo workflow cd-blue-green-switch.yml
+    slot: blue
+
   ports:
     - name: http
       port: 5000
