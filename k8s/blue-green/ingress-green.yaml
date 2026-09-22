@@ -1,9 +1,9 @@
 # =============================================================================
 # ingress-green.yaml — Ingress dedicado ao slot GREEN
 # =============================================================================
-# Acessa o slot green diretamente, sem depender do switch.
 # Host: app-go-verde.local
-# Backend: Service app-go-green (ClusterIP do slot green)
+# Backend: Service app-go-green (ClusterIP do slot green).
+# IngressClass: traefik (padrão do K3s).
 # =============================================================================
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -11,7 +11,7 @@ metadata:
   name: app-go-green-temp
   namespace: blue-green
 spec:
-  ingressClassName: nginx
+  ingressClassName: traefik
   rules:
     - host: app-go-verde.local
       http:
