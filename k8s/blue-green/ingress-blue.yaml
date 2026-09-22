@@ -1,9 +1,9 @@
 # =============================================================================
 # ingress-blue.yaml — Ingress dedicado ao slot BLUE
 # =============================================================================
-# Acessa o slot blue diretamente, sem depender do switch.
 # Host: app-go-azul.local
-# Backend: Service app-go-blue (ClusterIP do slot blue)
+# Backend: Service app-go-blue (ClusterIP do slot blue).
+# IngressClass: traefik (padrão do K3s).
 # =============================================================================
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -11,7 +11,7 @@ metadata:
   name: app-go-blue-temp
   namespace: blue-green
 spec:
-  ingressClassName: nginx
+  ingressClassName: traefik
   rules:
     - host: app-go-azul.local
       http:
