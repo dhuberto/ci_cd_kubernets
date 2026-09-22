@@ -1,27 +1,5 @@
----
 # =============================================================================
-# playbook.yml — prepara EC2 para K3s
-# =============================================================================
-#
-# Responsabilidades:
-#   1. Instalar K3s Server
-#   2. Garantir K3s ativo
-#   3. Configurar kubeconfig para ec2-user
-#   4. Disponibilizar kubectl para ec2-user
-#   5. Criar namespaces da aplicação
-#   6. Validar o cluster
-#
-# O K3s fornece:
-#   - containerd
-#   - kubectl via k3s kubectl
-#   - Traefik
-#   - local-path-provisioner
-#
-# Hosts da aplicação são responsabilidade dos Ingresses:
-#   - rolling.local
-#   - app-go.local
-#   - app-go-azul.local
-#   - app-go-verde.local
+# ANSIBLE - PROVISIONAMENTO DO SERVIDOR K3S
 # =============================================================================
 
 - name: Configurar EC2 para o cluster K3s
@@ -31,66 +9,56 @@
 
   vars:
     k3s_version: "v1.31.5+k3s1"
-
     namespaces:
       - rolling
       - blue-green
 
   tasks:
 
-    # =========================================================================
-    # 1. K3s
-    # =========================================================================
-
-    - name: Verificar se K3s já está instalado
-      stat:
+    # 1. Verificar K3s
+    - name: Verificar se o K3s já está instalado
+      ansible.builtin.stat:
         path: /usr/local/bin/k3s
       register: k3s_bin
 
+    # 2. Instalar K3s
     - name: Instalar K3s Server
       become: true
-      shell: |
+      ansible.builtin.shell: |
         curl -sfL https://get.k3s.io | \
-          INSTALL_K3S_VERSION={{ k3s_version }} sh -
+        INSTALL_K3S_VERSION={{ k3s_version }} sh -
       args:
         creates: /usr/local/bin/k3s
       when: not k3s_bin.stat.exists
 
+    # 3. Garantir K3s ativo
     - name: Garantir K3s habilitado e rodando
       become: true
-      systemd:
+      ansible.builtin.systemd:
         name: k3s
         enabled: true
         state: started
 
+    # 4. Aguardar Kubernetes
     - name: Aguardar o nó ficar Ready
       become: true
-      command:
-        argv:
-          - /usr/local/bin/k3s
-          - kubectl
-          - wait
-          - --for=condition=Ready
-          - node
-          - --all
-          - --timeout=180s
+      ansible.builtin.command:
+        cmd: k3s kubectl wait --for=condition=Ready node --all --timeout=180s
       changed_when: false
 
-    # =========================================================================
-    # 2. Kubeconfig do ec2-user
-    # =========================================================================
-
-    - name: Criar diretório .kube
-      file:
+    # 5. Criar diretório kubeconfig
+    - name: Criar diretório .kube do ec2-user
+      ansible.builtin.file:
         path: /home/ec2-user/.kube
         state: directory
         owner: ec2-user
         group: ec2-user
         mode: "0700"
 
-    - name: Copiar kubeconfig do K3s
+    # 6. Copiar kubeconfig
+    - name: Copiar kubeconfig do K3s para o ec2-user
       become: true
-      copy:
+      ansible.builtin.copy:
         src: /etc/rancher/k3s/k3s.yaml
         dest: /home/ec2-user/.kube/config
         remote_src: true
@@ -98,64 +66,62 @@
         group: ec2-user
         mode: "0600"
 
+    # 7. Descobrir IP privado
     - name: Descobrir IP privado da EC2
-      command:
-        cmd: hostname -I
-      register: hostname_ips
+      ansible.builtin.shell: hostname -I | awk '{print $1}'
+      register: private_ip
       changed_when: false
 
-    - name: Definir IP privado
-      set_fact:
-        private_ip: "{{ hostname_ips.stdout.split()[0] }}"
-
-    - name: Configurar endpoint do kubeconfig
+    # 8. Ajustar endpoint do kubeconfig
+    - name: Substituir localhost pelo IP privado
       become: true
-      replace:
+      ansible.builtin.replace:
         path: /home/ec2-user/.kube/config
-        regexp: 'https://127\.0\.0\.1:6443'
-        replace: 'https://{{ private_ip }}:6443'
+        regexp: '127\.0\.0\.1'
+        replace: "{{ private_ip.stdout }}"
 
-    # =========================================================================
-    # 3. kubectl
-    # =========================================================================
-
-    - name: Criar symlink kubectl
+    # 9. Criar kubectl
+    - name: Criar symlink do kubectl
       become: true
-      file:
+      ansible.builtin.file:
         src: /usr/local/bin/k3s
         dest: /usr/local/bin/kubectl
         state: link
         force: true
 
-    - name: Garantir acesso do ec2-user ao kubectl
-      command:
-        cmd: /usr/local/bin/kubectl version --client
-      environment:
-        KUBECONFIG: /home/ec2-user/.kube/config
-      changed_when: false
-
-    - name: Validar acesso do ec2-user ao cluster
-      command:
-        cmd: /usr/local/bin/kubectl get nodes -o wide
-      environment:
-        KUBECONFIG: /home/ec2-user/.kube/config
-      become: false
-      become_user: ec2-user
-      register: nodes_check
-      changed_when: false
-
-    # =========================================================================
-    # 4. Namespaces
-    # =========================================================================
-
-    - name: Criar namespaces da aplicação
-      command:
-        cmd: /usr/local/bin/kubectl create namespace {{ item }}
-      environment:
-        KUBECONFIG: /home/ec2-user/.kube/config
+    # 10. Criar namespaces
+    - name: Criar namespaces
+      become: true
+      ansible.builtin.command:
+        cmd: "k3s kubectl create namespace {{ item }}"
       register: namespace_result
       failed_when:
         - namespace_result.rc != 0
-        - "'AlreadyExists' not in (namespace_result.stderr | default(''))"
+        - "'AlreadyExists' not in namespace_result.stderr"
       changed_when: namespace_result.rc == 0
-      loop: "{{
+      loop: "{{ namespaces }}"
+
+    # 11. Corrigir acesso ao kubeconfig
+    - name: Garantir proprietário do kubeconfig
+      become: true
+      ansible.builtin.file:
+        path: /home/ec2-user/.kube/config
+        owner: ec2-user
+        group: ec2-user
+        mode: "0600"
+
+    # 12. Validar kubectl como ec2-user
+    - name: Validar acesso Kubernetes
+      become: true
+      become_user: ec2-user
+      environment:
+        KUBECONFIG: /home/ec2-user/.kube/config
+      ansible.builtin.command:
+        cmd: /usr/local/bin/kubectl get nodes -o wide
+      register: kubectl_nodes
+      changed_when: false
+
+    # 13. Mostrar nodes
+    - name: Mostrar nodes
+      ansible.builtin.debug:
+        msg: "{{ kubectl_nodes.stdout_lines }}"
