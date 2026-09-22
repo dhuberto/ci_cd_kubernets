@@ -35,6 +35,7 @@ jobs:
     name: Build & Push
     runs-on: ubuntu-latest
     environment: aws
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,6 +59,7 @@ jobs:
               'require github.com/lib/pq v1.10.9' \
               > go.mod
           fi
+
           go mod tidy
 
       - name: Setup Buildx
@@ -84,13 +86,14 @@ jobs:
             echo ""
             echo "- Tag: \`${{ env.IMAGE_TAG }}\`"
             echo "- Imagem: \`${{ env.IMAGE_NAME }}\`"
-          } >> $GITHUB_STEP_SUMMARY
+          } >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
     name: Rolling deploy
     needs: build-and-push
     runs-on: ubuntu-latest
     environment: aws
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -103,57 +106,84 @@ jobs:
 
       - name: Renderizar manifesto com a imagem
         run: |
-          sed -i "s|IMAGE_PLACEHOLDER|${{ env.IMAGE_NAME }}|g" k8s/rolling/deployment.yaml
+          sed -i \
+            "s|IMAGE_PLACEHOLDER|${{ env.IMAGE_NAME }}|g" \
+            k8s/rolling/deployment.yaml
 
       - name: Copiar manifestos
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
-            ec2-user@${{ vars.EC2_PUBLIC_IP }} "mkdir -p ~/rolling"
+            ec2-user@${{ vars.EC2_PUBLIC_IP }} \
+            "mkdir -p ~/rolling"
+
           scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             k8s/rolling/*.yaml \
             ec2-user@${{ vars.EC2_PUBLIC_IP }}:/home/ec2-user/rolling/
 
+      # -----------------------------------------------------------------------
+      # GHCR Secret
+      # -----------------------------------------------------------------------
       - name: Criar imagePullSecret no namespace rolling
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             ec2-user@${{ vars.EC2_PUBLIC_IP }} \
-            "/usr/local/bin/kubectl -n rolling create secret docker-registry ghcr-secret \
-               --docker-server=ghcr.io \
-               --docker-username=${{ github.actor }} \
-               --docker-password=${{ secrets.GITHUB_TOKEN }} \
-               --dry-run=client -o yaml | /usr/local/bin/kubectl apply -f -"
+            "sudo /usr/local/bin/kubectl -n rolling create secret docker-registry ghcr-secret \
+              --docker-server=ghcr.io \
+              --docker-username=${{ github.actor }} \
+              --docker-password=${{ secrets.GITHUB_TOKEN }} \
+              --dry-run=client -o yaml | \
+              sudo /usr/local/bin/kubectl apply -f -"
 
+      # -----------------------------------------------------------------------
+      # PostgreSQL
+      # -----------------------------------------------------------------------
       - name: Aplicar Postgres
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             ec2-user@${{ vars.EC2_PUBLIC_IP }} \
-            '/usr/local/bin/kubectl apply -f /home/ec2-user/rolling/postgres-secret.yaml && \
-             /usr/local/bin/kubectl apply -f /home/ec2-user/rolling/postgres-service.yaml && \
-             /usr/local/bin/kubectl apply -f /home/ec2-user/rolling/postgres-statefulset.yaml && \
-             /usr/local/bin/kubectl -n rolling rollout status statefulset/postgres --timeout=180s'
+            'sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/rolling/postgres-secret.yaml && \
+             sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/rolling/postgres-service.yaml && \
+             sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/rolling/postgres-statefulset.yaml && \
+             sudo /usr/local/bin/kubectl -n rolling rollout status \
+              statefulset/postgres --timeout=180s'
 
+      # -----------------------------------------------------------------------
+      # Aplicação
+      # -----------------------------------------------------------------------
       # Aplica RBAC + Deployments + Services + Ingress.
       # O rollout status aponta para o Deployment `app-go`.
       - name: Aplicar app + RBAC
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             ec2-user@${{ vars.EC2_PUBLIC_IP }} \
-            '/usr/local/bin/kubectl apply -f /home/ec2-user/rolling/rbac.yaml && \
-             /usr/local/bin/kubectl apply -f /home/ec2-user/rolling/ && \
-             /usr/local/bin/kubectl -n rolling rollout status deploy/app-go --timeout=180s'
+            'sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/rolling/rbac.yaml && \
+             sudo /usr/local/bin/kubectl apply \
+              -f /home/ec2-user/rolling/ && \
+             sudo /usr/local/bin/kubectl -n rolling rollout status \
+              deploy/app-go --timeout=180s'
 
+      # -----------------------------------------------------------------------
+      # Smoke test
+      # -----------------------------------------------------------------------
       - name: Smoke test
         run: |
           for i in $(seq 1 20); do
             code=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Host: rolling.local" \
-              http://${{ vars.EC2_PUBLIC_IP }}/healthz || true)
+              "http://${{ vars.EC2_PUBLIC_IP }}/healthz" || true)
+
             if [ "$code" = "200" ]; then
               echo "Smoke OK (tentativa $i)"
               exit 0
             fi
+
             echo "tentativa $i — code=$code"
             sleep 5
           done
+
           echo "Smoke test falhou" >&2
           exit 1
