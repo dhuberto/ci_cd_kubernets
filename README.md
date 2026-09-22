@@ -1,4 +1,4 @@
-# CI/CD — app-go (K3s na AWS)
+# CI/CD — App-go (K3s na AWS)
 
 [![CI](https://github.com/dhuberto/ci_cd_kubernets/actions/workflows/ci.yml/badge.svg)](https://github.com/dhuberto/ci_cd_kubernets/actions/workflows/ci.yml)
 
@@ -437,63 +437,60 @@ govulncheck ./...
 ```
 ci_cd_kubernets/
 ├── .github/
-│   ├── CODEOWNERS
+│   ├── CODEOWNERS                         # Define os responsáveis/revisores automáticos pelas alterações do repositório.
 │   └── workflows/
-│       ├── ci.yml                          # CI: go vet, go test, govulncheck, Trivy
-│       ├── _reusable-test.yml              # Workflow reutilizável
-│       ├── cd-provision.yml                # Terraform + Ansible (instala K3s)
-│       ├── cd-rolling.yml                  # Build+push e deploy Rolling
-│       ├── cd-blue-green.yml               # Build+push e deploy por cor
-│       ├── cd-blue-green-switch.yml        # Patch do Service active
-│       ├── cd-destroy.yml                  # Teardown parcial
-│       └── cd-destroy-full.yml             # Teardown total
+│       ├── ci.yml                        # Executa CI: validação Go, testes, análise estática e scans de segurança.
+│       ├── _reusable-test.yml            # Centraliza etapas reutilizáveis de testes para evitar duplicação nos workflows.
+│       ├── cd-provision.yml              # Provisiona AWS com Terraform e configura a EC2/K3s com Ansible.
+│       ├── cd-rolling.yml                # Faz build, push no GHCR e deploy Rolling no namespace rolling.
+│       ├── cd-blue-green.yml             # Faz build, push e deploy da aplicação no slot blue ou green.
+│       ├── cd-blue-green-switch.yml      # Altera o selector do Service ativo para trocar entre blue e green.
+│       ├── cd-destroy.yml                # Remove a infraestrutura AWS criada pelo ambiente sem executar a limpeza completa.
+│       └── cd-destroy-full.yml           # Executa a destruição completa da infraestrutura e recursos relacionados.
 │
 ├── terraform/
-│   ├── providers.tf                        # Provider AWS + versão do Terraform
-│   ├── variables.tf                        # Variáveis: região, tipo, key_name, CIDR
-│   ├── main.tf                             # Recursos AWS
-│   ├── outputs.tf                          # Outputs consumidos pelo workflow
-│   └── user_data.sh                        # Bootstrap da EC2 (git + curl)
+│   ├── providers.tf                      # Define o provider AWS e as versões utilizadas pelo Terraform.
+│   ├── variables.tf                      # Define região, tipo da EC2, chave SSH e parâmetros de rede.
+│   ├── main.tf                           # Cria VPC, subnet, Internet Gateway, Security Group e instância EC2.
+│   ├── outputs.tf                        # Expõe IP e demais informações da infraestrutura para os workflows.
+│   └── user_data.sh                      # Executa o bootstrap inicial da EC2 antes da configuração via Ansible.
 │
 ├── ansible/
-│   ├── ansible.cfg                         # Configuração global
-│   └── playbook.yml                        # Instala K3s + cria namespaces
+│   ├── ansible.cfg                       # Define as configurações utilizadas pelo Ansible durante a configuração da EC2.
+│   └── playbook.yml                      # Instala/configura K3s e prepara o servidor para os namespaces da aplicação.
 │
 ├── k8s/
 │   ├── rolling/
-│   │   ├── postgres-secret.yaml
-│   │   ├── postgres-service.yaml
-│   │   ├── postgres-statefulset.yaml
-│   │   ├── rbac.yaml
-│   │   ├── deployment.yaml
-│   │   ├── service.yaml
-│   │   └── ingress.yaml                    # IngressClass: traefik
+│   │   ├── postgres-secret.yaml           # Armazena as credenciais do PostgreSQL no namespace rolling.
+│   │   ├── postgres-service.yaml          # Expõe o PostgreSQL internamente para a aplicação rolling.
+│   │   ├── postgres-statefulset.yaml      # Mantém o PostgreSQL persistente com StatefulSet e PVC.
+│   │   ├── rbac.yaml                      # Cria ServiceAccount, Role e RoleBinding utilizados pela aplicação rolling.
+│   │   ├── deployment.yaml                # Define o Deployment app-go com estratégia RollingUpdate.
+│   │   ├── service.yaml                   # Expõe os Pods app-go internamente para o Ingress.
+│   │   └── ingress.yaml                   # Publica o ambiente Rolling através do hostname rolling.local usando Traefik.
+│   │
 │   └── blue-green/
-│       ├── postgres-secret.yaml
-│       ├── postgres-service.yaml
-│       ├── postgres-statefulset.yaml
-│       ├── rbac.yaml
-│       ├── deployment-blue.yaml
-│       ├── deployment-green.yaml
-│       ├── service-blue.yaml
-│       ├── service-green.yaml
-│       ├── service-active.yaml
-│       ├── ingress.yaml                    # IngressClass: traefik
-│       ├── ingress-blue.yaml               # IngressClass: traefik
-│       └── ingress-green.yaml              # IngressClass: traefik
-│
-├── docs/
-│   ├── ci-pipeline.md
-│   └── cd-pipeline.md
-│
+│       ├── postgres-secret.yaml            # Armazena as credenciais do PostgreSQL no namespace blue-green.
+│       ├── postgres-service.yaml           # Expõe o PostgreSQL internamente para os deployments blue e green.
+│       ├── postgres-statefulset.yaml       # Mantém o PostgreSQL persistente do ambiente blue-green.
+│       ├── rbac.yaml                       # Cria as permissões Kubernetes utilizadas pela aplicação blue-green.
+│       ├── deployment-blue.yaml            # Define a versão blue da aplicação com APP_COLOR=blue.
+│       ├── deployment-green.yaml            # Define a versão green da aplicação com APP_COLOR=green.
+│       ├── service-blue.yaml                # Expõe exclusivamente os Pods identificados com slot=blue.
+│       ├── service-green.yaml               # Expõe exclusivamente os Pods identificados com slot=green.
+│       ├── service-active.yaml              # Service ativo cujo selector determina qual slot recebe o tráfego principal.
+│       ├── ingress.yaml                     # Publica o Service ativo através do hostname app-go.local usando Traefik.
+│       ├── ingress-blue.yaml                # Publica diretamente o slot blue através de app-go-azul.local.
+│       └── ingress-green.yaml               # Publica diretamente o slot green através de app-go-verde.local.
 ├── src/
-│   ├── main.go
-│   └── main_test.go
+│   ├── main.go                            # Implementa a aplicação Go, HTTP, SSR, PostgreSQL e endpoints da aplicação.
+│   └── main_test.go                       # Contém os testes automatizados da aplicação Go.
 │
-├── go.mod
-├── go.sum
-├── Dockerfile
-└── README.md
+├── go.mod                                 # Define o módulo Go e suas dependências diretas.
+├── go.sum                                 # Registra hashes das dependências Go para builds verificáveis.
+├── Dockerfile                              # Define o build multi-stage e a imagem final da aplicação Go.
+└── README.md                               # Documenta arquitetura, instalação, CI/CD, deploy, acesso e rollback.
+
 ```
 
 ---
