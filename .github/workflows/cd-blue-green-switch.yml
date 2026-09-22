@@ -1,25 +1,8 @@
 # =============================================================================
 # CD - Blue/Green (switch de tráfego)
 # =============================================================================
-#
-# Hosts:
-#   rolling.local       → Rolling
-#   app-go.local        → tráfego ativo
-#   app-go-azul.local   → Blue
-#   app-go-verde.local  → Green
-#
-# O switch altera somente o selector do Service app-go-active.
-#
-# Fluxo:
-#
-#   PATCH
-#     ↓
-#   validar selector
-#     ↓
-#   validar endpoints
-#     ↓
-#   validar app-go.local
-#
+# Faz o cutover alterando somente o selector do Service app-go-active.
+# Hosts: app-go.local | app-go-azul.local | app-go-verde.local
 # =============================================================================
 
 name: CD - Blue/Green (switch de tráfego)
@@ -42,78 +25,271 @@ concurrency:
   group: blue-green-switch
   cancel-in-progress: false
 
+env:
+  EC2_USER: ec2-user
+  EC2_HOST: ${{ vars.EC2_PUBLIC_IP }}
+  NAMESPACE: blue-green
+  ACTIVE_SERVICE: app-go-active
+  ACTIVE_HOST: app-go.local
+
 jobs:
 
   switch:
+
     name: Switch para ${{ inputs.color }}
+
     runs-on: ubuntu-latest
+
     environment: aws
 
     steps:
 
-      # -----------------------------------------------------------------------
       # SSH
-      # -----------------------------------------------------------------------
-
       - name: Configurar chave SSH
+        shell: bash
         run: |
+          set -euo pipefail
+
           mkdir -p ~/.ssh
-          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+
+          printf '%s\n' '${{ secrets.EC2_SSH_KEY }}' \
+            > ~/.ssh/deploy_key
+
           chmod 600 ~/.ssh/deploy_key
 
-      # -----------------------------------------------------------------------
-      # CUTOVER
-      # -----------------------------------------------------------------------
+          ssh-keygen \
+            -y \
+            -f ~/.ssh/deploy_key \
+            > /dev/null
 
-      - name: Patch do Service
+          echo "Chave SSH válida."
+
+      # Conectividade
+      - name: Testar SSH
+        shell: bash
         run: |
-          ssh -i ~/.ssh/deploy_key \
+          set -euo pipefail
+
+          ssh \
+            -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
-            ec2-user@${{ vars.EC2_PUBLIC_IP }} \
-            'sudo /usr/local/bin/kubectl \
-              -n blue-green \
-              patch svc app-go-active \
-              -p "{\"spec\":{\"selector\":{\"app\":\"app-go\",\"slot\":\"${{ inputs.color }}\"}}}"'
+            -o ConnectTimeout=10 \
+            "${EC2_USER}@${EC2_HOST}" \
+            'echo "SSH OK"'
 
-      # -----------------------------------------------------------------------
-      # CONFIRMAR SELECTOR
-      # -----------------------------------------------------------------------
-
-      - name: Confirmar selector
+      # Estado atual
+      - name: Verificar estado atual
+        shell: bash
         run: |
+          set -euo pipefail
+
+          echo "Service ativo antes do switch:"
+
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            "${EC2_USER}@${EC2_HOST}" \
+            "sudo /usr/local/bin/kubectl \
+              -n ${NAMESPACE} \
+              get svc ${ACTIVE_SERVICE} \
+              -o jsonpath='{.spec.selector}'"
+
+          echo ""
+
+      # CUTOVER
+      - name: Executar switch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Alterando tráfego para: ${{
+            inputs.color
+          }}"
+
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            "${EC2_USER}@${EC2_HOST}" \
+            "sudo /usr/local/bin/kubectl \
+              -n ${NAMESPACE} \
+              patch svc ${ACTIVE_SERVICE} \
+              --type=merge \
+              -p '{\"spec\":{\"selector\":{\"app\":\"app-go\",\"slot\":\"${{ inputs.color }}\"}}}'"
+
+          echo ""
+          echo "Switch aplicado."
+
+      # Confirma selector
+      - name: Confirmar selector
+        shell: bash
+        run: |
+          set -euo pipefail
+
           selector=$(ssh \
             -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
-            ec2-user@${{ vars.EC2_PUBLIC_IP }} \
-            'sudo /usr/local/bin/kubectl \
-              -n blue-green \
-              get svc app-go-active \
-              -o jsonpath="{.spec.selector}"')
+            "${EC2_USER}@${EC2_HOST}" \
+            "sudo /usr/local/bin/kubectl \
+              -n ${NAMESPACE} \
+              get svc ${ACTIVE_SERVICE} \
+              -o jsonpath='{.spec.selector}'")
 
-          echo "Selector atual: $selector"
+          echo "Selector atual:"
+          echo "${selector}"
 
           expected='{"app":"app-go","slot":"${{ inputs.color }}"}'
 
-          if [ "$selector" != "$expected" ]; then
-            echo "Selector incorreto." >&2
-            echo "Esperado: $expected" >&2
-            echo "Atual:    $selector" >&2
+          if [[ "${selector}" != *"slot=${{ inputs.color }}"* ]]; then
+            echo "ERRO: selector não aponta para ${{ inputs.color }}."
             exit 1
           fi
 
-      # -----------------------------------------------------------------------
-      # CONFIRMAR ENDPOINTS
-      # -----------------------------------------------------------------------
+          echo "Selector confirmado."
 
-      - name: Aguardar endpoints do Service ativo
+      # Verifica endpoints
+      - name: Aguardar endpoints da cor
+        shell: bash
         run: |
+          set -euo pipefail
+
+          echo "Aguardando endpoints..."
+
           for i in $(seq 1 20); do
 
             endpoints=$(ssh \
               -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
-              ec2-user@${{ vars.EC2_PUBLIC_IP }} \
-              'sudo /usr/local/bin/kubectl \
-                -n blue-green \
-                get endpoints app-go-active \
-                -o jsonpath="{.subsets[*].addresses[*].ip}"
+              "${EC2_USER}@${EC2_HOST}" \
+              "sudo /usr/local/bin/kubectl \
+                -n ${NAMESPACE} \
+                get endpoints ${ACTIVE_SERVICE} \
+                -o jsonpath='{.subsets[*].addresses[*].ip}'" \
+              || true)
+
+            if [ -n "${endpoints}" ]; then
+              echo "Endpoints encontrados:"
+              echo "${endpoints}"
+              exit 0
+            fi
+
+            echo "tentativa ${i}/20 — nenhum endpoint ainda"
+
+            sleep 3
+          done
+
+          echo "ERRO: Service ${ACTIVE_SERVICE} não possui endpoints."
+          exit 1
+
+      # Diagnóstico
+      - name: Diagnóstico do Service
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            "${EC2_USER}@${EC2_HOST}" \
+            "sudo /usr/local/bin/kubectl \
+              -n ${NAMESPACE} \
+              get pods -o wide"
+
+          echo "================================================="
+
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            "${EC2_USER}@${EC2_HOST}" \
+            "sudo /usr/local/bin/kubectl \
+              -n ${NAMESPACE} \
+              get svc ${ACTIVE_SERVICE} -o wide"
+
+          echo "================================================="
+
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            "${EC2_USER}@${EC2_HOST}" \
+            "sudo /usr/local/bin/kubectl \
+              -n ${NAMESPACE} \
+              get endpoints ${ACTIVE_SERVICE} -o yaml"
+
+          echo "================================================="
+
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            "${EC2_USER}@${EC2_HOST}" \
+            "sudo /usr/local/bin/kubectl \
+              -n ${NAMESPACE} \
+              get ingress -o wide"
+
+      # Smoke test
+      - name: Smoke test via app-go.local
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "================================================="
+          echo "SMOKE TEST BLUE/GREEN"
+          echo "================================================="
+          echo "IP:    ${EC2_HOST}"
+          echo "Host:  ${ACTIVE_HOST}"
+          echo "Cor:   ${{ inputs.color }}"
+          echo "Path:  /healthz"
+          echo "================================================="
+
+          for i in $(seq 1 20); do
+
+            code=$(curl \
+              -sS \
+              -o /dev/null \
+              -w "%{http_code}" \
+              --connect-timeout 5 \
+              --max-time 10 \
+              -H "Host: ${ACTIVE_HOST}" \
+              "http://${EC2_HOST}/healthz" \
+              || true)
+
+            if [ "${code}" = "200" ]; then
+
+              echo ""
+              echo "Smoke OK."
+              echo "Tentativa: ${i}"
+              echo "HTTP: ${code}"
+
+              exit 0
+            fi
+
+            echo "tentativa ${i}/20 — HTTP ${code}"
+
+            sleep 3
+          done
+
+          echo ""
+          echo "================================================="
+          echo "SMOKE TEST FALHOU"
+          echo "================================================="
+
+          echo "O switch foi aplicado, mas o Ingress não retornou HTTP 200."
+
+          exit 1
+
+      # Resumo
+      - name: Resumo
+        if: success()
+        shell: bash
+        run: |
+          {
+            echo "### Blue/Green switch concluído"
+            echo ""
+            echo "- Cor ativa: \`${{ inputs.color }}\`"
+            echo "- Service: \`${ACTIVE_SERVICE}\`"
+            echo "- Selector: \`slot=${{ inputs.color }}\`"
+            echo "- Host: \`${ACTIVE_HOST}\`"
+            echo "- IP: \`${EC2_HOST}\`"
+            echo "- Smoke test: **OK**"
+            echo ""
+            echo "Rollback: execute novamente escolhendo a cor contrária."
+          } >> "$GITHUB_STEP_SUMMARY"
