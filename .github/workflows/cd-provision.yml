@@ -37,7 +37,7 @@ concurrency:
 
 jobs:
   provision:
-    name: Provision EC2 + kubernets + ingress-nginx
+    name: Provision EC2 + kubernets
     runs-on: ubuntu-latest
     environment: aws
     outputs:
