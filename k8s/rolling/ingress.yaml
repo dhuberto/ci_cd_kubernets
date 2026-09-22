@@ -2,7 +2,8 @@
 # ingress.yaml — Ingress do Rolling Update
 # =============================================================================
 # Host: rolling.local
-# Backend: Service `app-go` do namespace rolling.
+# Backend: Service app-go do namespace rolling.
+# IngressClass: traefik (padrão do K3s).
 # =============================================================================
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -10,7 +11,7 @@ metadata:
   name: app-go
   namespace: rolling
 spec:
-  ingressClassName: nginx
+  ingressClassName: traefik
   rules:
     - host: rolling.local
       http:
