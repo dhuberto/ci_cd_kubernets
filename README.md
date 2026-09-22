@@ -1,9 +1,9 @@
-# CI/CD — App-go Go + PostgreSQL + Docker + KIND
+# CI/CD — app-go (K3s na AWS)
 
-[![CI](https://github.com/dhuberto/ci_cd/actions/workflows/ci.yml/badge.svg)](https://github.com/dhuberto/ci_cd/actions/workflows/ci.yml)
+[![CI](https://github.com/dhuberto/ci_cd_kubernets/actions/workflows/ci.yml/badge.svg)](https://github.com/dhuberto/ci_cd_kubernets/actions/workflows/ci.yml)
 
 Pipeline completo de **CI/CD** para uma aplicação web em **Go + PostgreSQL**,
-com deploy automatizado em **Kubernetes** (cluster `kind` em EC2) usando
+com deploy automatizado em **K3s** (Kubernetes leve) na EC2, usando
 **Rolling Update** e **Blue/Green**.
 
 O projeto cobre desde a validação do código (testes, análise estática,
@@ -35,13 +35,12 @@ O pipeline cobre dois ciclos:
   matrix Go 1.25, `govulncheck` (auditoria de CVEs) e Trivy (scan de
   segurança do filesystem e da imagem). Se qualquer gate falhar, o
   merge é bloqueado.
-- **CD** — provisiona a infraestrutura na AWS via Terraform, configura
-  o cluster `kind` na EC2 via Ansible, e faz deploy com duas
-  estratégias: **Rolling Update** e **Blue/Green** com switch de
-  tráfego e rollback.
+- **CD** — provisiona a infraestrutura na AWS via Terraform, instala o
+  K3s na EC2 via Ansible, e faz deploy com duas estratégias:
+  **Rolling Update** e **Blue/Green** com switch de tráfego e rollback.
 
 A imagem da aplicação é publicada no **GHCR**
-(`ghcr.io/dhuberto/ci_cd:<sha>`).
+(`ghcr.io/dhuberto/ci_cd_kubernets:<sha>`).
 
 **Aplicação:** todo-list minimalista em Go com renderização no servidor
 (SSR) e persistência em PostgreSQL. O binário é estático
@@ -55,10 +54,10 @@ Postgres é compilado dentro do binário — zero dependências em runtime.
 | Camada | Tecnologia |
 |---|---|
 | **Aplicação** | Go 1.25, `net/http`, `html/template`, `database/sql`, `lib/pq` |
-| **Banco de dados** | PostgreSQL (StatefulSet + PVC no Kubernetes) |
+| **Banco de dados** | PostgreSQL (StatefulSet + PVC no K3s) |
 | **Container** | Docker (multi-stage build, Alpine, binário estático) |
-| **Cluster** | kind (Kubernetes in Docker) em EC2 |
-| **Ingress** | ingress-nginx |
+| **Cluster** | K3s (Kubernetes leve) em EC2 |
+| **Ingress** | Traefik (padrão do K3s) |
 | **CI/CD** | GitHub Actions |
 | **Registry** | GHCR (GitHub Container Registry) |
 | **Infra as Code** | Terraform |
@@ -73,7 +72,7 @@ GitHub Actions (runner hospedado)
  │
  ├── cd-provision.yml
  │     └── Terraform: VPC + subnet + IGW + SG + EC2 (Amazon Linux 2023)
- │     └── Ansible: Docker + kind + kubectl + ingress-nginx + namespaces
+ │     └── Ansible: K3s Server + namespaces
  │
  ├── cd-rolling.yml
  │     └── build+push GHCR → kubectl apply no namespace rolling → smoke test
@@ -86,7 +85,7 @@ GitHub Actions (runner hospedado)
  │
  ▼ (SSH)
 EC2 Amazon Linux 2023
- └── cluster kind "devops-labs"
+ └── cluster K3s "k3s"
        ├── namespace: rolling
        │     ├── StatefulSet postgres   (1 réplica, PVC 1Gi, postgres:alpine)
        │     ├── Service postgres       (headless, para DNS estável)
@@ -110,12 +109,12 @@ EC2 Amazon Linux 2023
 | Camada | Tecnologia | Papel |
 |---|---|---|
 | Infra AWS | Terraform | VPC, subnet, IGW, SG, EC2 |
-| Configuração da EC2 | Ansible | Docker, kind, kubectl, ingress-nginx |
-| Cluster | kind | Kubernetes local dentro de Docker |
-| Ingress | ingress-nginx | Ponto único de entrada HTTP |
+| Configuração da EC2 | Ansible | K3s Server + namespaces |
+| Cluster | K3s | Kubernetes leve em EC2 |
+| Ingress | Traefik | Ponto único de entrada HTTP |
 | Banco de dados | Postgres (StatefulSet + PVC) | Persistência real (1Gi por namespace) |
 | Aplicação | Go + `database/sql` + `lib/pq` | SSR, binário estático, sem runtime deps |
-| Registry | GHCR | Imagem `ghcr.io/dhuberto/ci_cd:<sha>` |
+| Registry | GHCR | Imagem `ghcr.io/dhuberto/ci_cd_kubernets:<sha>` |
 | Deploy | kubectl via SSH | Aplica manifestos no cluster |
 | Rollback | `kubectl patch` no Service | Troca o selector ativo (Blue/Green) |
 
@@ -139,10 +138,9 @@ EC2 Amazon Linux 2023
 - **Reusable workflow** (`_reusable-test.yml`) extrai os steps de
   teste, evitando duplicação entre jobs.
 - **Cache de módulos Go** (`go.sum`).
-- **`permissions:` mínimo** — `contents: read` por padrão; jobs que
-  precisam de mais pedem explicitamente.
-- **Branch protection** — required checks (`Test (Go 1.25)`,
-  `Dependency audit`) bloqueiam o merge se qualquer um falhar.
+- **`permissions:` mínimo** — `contents: read` por padrão.
+- **Branch protection** — required checks bloqueiam o merge se
+  qualquer um falhar.
 - **CODEOWNERS** — revisores atribuídos automaticamente por arquivo.
 
 ### Como disparar o CI
@@ -167,8 +165,9 @@ Actions → CD - Provision Infra → Run workflow
 **O que faz:**
 
 - Cria VPC, subnet, IGW, SG e EC2 (Amazon Linux 2023) via Terraform
-- Instala Docker via `user_data.sh`
-- Instala kind, kubectl, ingress-nginx e cria os namespaces via Ansible
+- Instala o K3s Server via Ansible (script oficial)
+- Ajusta o kubeconfig para o `ec2-user`
+- Cria os namespaces `rolling` e `blue-green`
 - Publica os artifacts `ec2-ssh-key` e `terraform-state`
 
 **Depois de rodar:**
@@ -219,7 +218,7 @@ Actions → CD - Blue/Green (deploy por cor) → Run workflow
 **O que faz:**
 
 - Build + push da imagem
-- Aplica o Postgres do namespace `blue-green` (Secret + Service + StatefulSet)
+- Aplica o Postgres do namespace `blue-green`
 - Aplica os Services (`app-go-blue`, `app-go-green`, `app-go-active`),
   os Ingress (`app-go.local`, `app-go-azul.local`, `app-go-verde.local`)
   e o Deployment `app-go-blue`
@@ -338,19 +337,22 @@ Comandos úteis dentro da EC2:
 
 ```bash
 # Pods da aplicação no rolling
-/usr/local/bin/kubectl -n rolling get pods -o wide
+kubectl -n rolling get pods -o wide
 
 # Postgres no rolling
-/usr/local/bin/kubectl -n rolling get statefulset,pvc
+kubectl -n rolling get statefulset,pvc
 
 # Pods no blue-green
-/usr/local/bin/kubectl -n blue-green get pods -o wide
+kubectl -n blue-green get pods -o wide
 
 # Ingress do blue-green
-/usr/local/bin/kubectl -n blue-green get ingress
+kubectl -n blue-green get ingress
 
 # Qual cor está ativa agora
-/usr/local/bin/kubectl -n blue-green get svc app-go-active -o jsonpath='{.spec.selector}'
+kubectl -n blue-green get svc app-go-active -o jsonpath='{.spec.selector}'
+
+# Nodes do cluster K3s
+kubectl get nodes -o wide
 ```
 
 ### Hostnames disponíveis
@@ -399,10 +401,7 @@ go run ./src
 ### Rodar com Docker
 
 ```bash
-# Build da imagem
 docker build -t app-go:dev .
-
-# Rodar (precisa de um Postgres acessível)
 docker run --rm -p 8080:5000 \
   -e DB_HOST=host.docker.internal \
   -e DB_PORT=5432 \
@@ -425,13 +424,8 @@ Acesse `http://localhost:8080/`.
 ### Rodar os checks do CI localmente
 
 ```bash
-# Análise estática
 go vet ./...
-
-# Testes
 go test -v ./...
-
-# Auditoria de dependências
 go install golang.org/x/vuln/cmd/govulncheck@latest
 govulncheck ./...
 ```
@@ -441,87 +435,87 @@ govulncheck ./...
 ## Estrutura do repositório
 
 ```
-ci_cd/
+ci_cd_kubernets/
 ├── .github/
-│   ├── CODEOWNERS                          # Define quem revisa PRs (dono por arquivo/pasta)
+│   ├── CODEOWNERS
 │   └── workflows/
 │       ├── ci.yml                          # CI: go vet, go test, govulncheck, Trivy
-│       ├── _reusable-test.yml              # Workflow reutilizável (workflow_call)
-│       ├── cd-provision.yml                # Provisiona AWS (Terraform) + configura kind (Ansible)
-│       ├── cd-rolling.yml                  # Build+push e deploy Rolling (com Postgres)
-│       ├── cd-blue-green.yml               # Build+push e deploy no slot blue ou green
-│       ├── cd-blue-green-switch.yml        # Patch do Service active (switch e rollback)
+│       ├── _reusable-test.yml              # Workflow reutilizável
+│       ├── cd-provision.yml                # Terraform + Ansible (instala K3s)
+│       ├── cd-rolling.yml                  # Build+push e deploy Rolling
+│       ├── cd-blue-green.yml               # Build+push e deploy por cor
+│       ├── cd-blue-green-switch.yml        # Patch do Service active
 │       ├── cd-destroy.yml                  # Teardown parcial
 │       └── cd-destroy-full.yml             # Teardown total
 │
-├── terraform/                              # IaC da AWS
+├── terraform/
 │   ├── providers.tf                        # Provider AWS + versão do Terraform
-│   ├── variables.tf                        # Variáveis: região, tipo, key_name, CIDR, disco
+│   ├── variables.tf                        # Variáveis: região, tipo, key_name, CIDR
 │   ├── main.tf                             # Recursos AWS
 │   ├── outputs.tf                          # Outputs consumidos pelo workflow
-│   └── user_data.sh                        # Bootstrap da EC2 (Docker)
+│   └── user_data.sh                        # Bootstrap da EC2 (git + curl)
 │
-├── ansible/                                # Configuração da EC2 após o provision
+├── ansible/
 │   ├── ansible.cfg                         # Configuração global
-│   └── playbook.yml                        # kind, kubectl, ingress-nginx, namespaces
+│   └── playbook.yml                        # Instala K3s + cria namespaces
 │
-├── k8s/                                    # Manifestos Kubernetes
+├── k8s/
 │   ├── rolling/
-│   │   ├── postgres-secret.yaml            # Credenciais do Postgres
-│   │   ├── postgres-service.yaml           # Service headless do StatefulSet
-│   │   ├── postgres-statefulset.yaml       # StatefulSet + PVC 1Gi
-│   │   ├── rbac.yaml                       # ServiceAccount + Role + RoleBinding
-│   │   ├── deployment.yaml                 # Deployment Rolling (APP_COLOR=purple)
-│   │   ├── service.yaml                    # Service ClusterIP
-│   │   └── ingress.yaml                    # Ingress rolling.local
+│   │   ├── postgres-secret.yaml
+│   │   ├── postgres-service.yaml
+│   │   ├── postgres-statefulset.yaml
+│   │   ├── rbac.yaml
+│   │   ├── deployment.yaml
+│   │   ├── service.yaml
+│   │   └── ingress.yaml                    # IngressClass: traefik
 │   └── blue-green/
-│       ├── postgres-secret.yaml            # Credenciais do Postgres
-│       ├── postgres-service.yaml           # Service headless
-│       ├── postgres-statefulset.yaml       # StatefulSet + PVC 1Gi
-│       ├── rbac.yaml                       # ServiceAccount + Role + RoleBinding
-│       ├── deployment-blue.yaml            # Slot blue (APP_COLOR=blue)
-│       ├── deployment-green.yaml           # Slot green (APP_COLOR=green)
-│       ├── service-blue.yaml               # ClusterIP do slot blue
-│       ├── service-green.yaml              # ClusterIP do slot green
-│       ├── service-active.yaml             # Service ativo (selector trocável)
-│       ├── ingress.yaml                    # Ingress app-go.local (aponta para o active)
-│       ├── ingress-blue.yaml               # Ingress app-go-azul.local (fixo no blue)
-│       └── ingress-green.yaml              # Ingress app-go-verde.local (fixo no green)
+│       ├── postgres-secret.yaml
+│       ├── postgres-service.yaml
+│       ├── postgres-statefulset.yaml
+│       ├── rbac.yaml
+│       ├── deployment-blue.yaml
+│       ├── deployment-green.yaml
+│       ├── service-blue.yaml
+│       ├── service-green.yaml
+│       ├── service-active.yaml
+│       ├── ingress.yaml                    # IngressClass: traefik
+│       ├── ingress-blue.yaml               # IngressClass: traefik
+│       └── ingress-green.yaml              # IngressClass: traefik
 │
 ├── docs/
-│   ├── ci-pipeline.md                      # Documentação detalhada do CI
-│   └── cd-pipeline.md                      # Documentação detalhada do CD
+│   ├── ci-pipeline.md
+│   └── cd-pipeline.md
 │
 ├── src/
-│   ├── main.go                             # Aplicação Go (HTTP + Postgres)
-│   └── main_test.go                        # Testes unitários dos handlers
+│   ├── main.go
+│   └── main_test.go
 │
-├── go.mod                                  # Módulo Go e dependências
-├── go.sum                                  # Checksums das dependências
-├── Dockerfile                              # Build multi-stage (Go estático + Alpine)
-└── README.md                               # Este arquivo
+├── go.mod
+├── go.sum
+├── Dockerfile
+└── README.md
 ```
 
 ---
 
 ## Decisões técnicas
 
-- **`kind` em vez de EKS:** custo zero, cluster sobe em ~1 min,
-  suficiente para demonstrar o fluxo completo de CI/CD. EKS seria
-  overkill para o escopo.
+- **K3s em vez de EKS:** custo controlado (~US$ 30/mês contra ~US$ 190 do
+  EKS com NAT Gateway + ALB), Kubernetes de verdade (produção-ready),
+  Traefik e local-path já vêm inclusos. Single-node é suficiente para
+  demonstrar Rolling Update e Blue/Green com persistência real.
 - **Terraform em vez de Console AWS:** infra reproduzível, revisável
-  e destruível por código. Zero cliques manuais.
+  e destruível por código.
 - **Ansible em vez de `user_data`:** mantém a configuração do cluster
   no repositório, versionada e idempotente.
-- **Um único Environment `aws`:** a arquitetura pede as duas
-  estratégias no mesmo cluster, não dois ambientes isolados.
 - **Go em vez de Python/Node:** binário estático de ~20 MB, zero
   dependências em runtime, `govulncheck` como gate de segurança.
-  Imagem final: ~20 MB (vs. ~180 MB de uma stack Node tradicional).
 - **Postgres como StatefulSet + PVC:** persistência real com 1Gi por
-  namespace. O StorageClass `local-path` do kind já provisiona o volume.
+  namespace. O `local-path` provisioner do K3s já cria o volume.
 - **GHCR em vez de Docker Hub:** autenticação nativa via `GITHUB_TOKEN`,
-  sem rate limit, integrado ao ciclo de PR do GitHub.
+  sem rate limit.
+- **Traefik como Ingress:** padrão do K3s, vem instalado e configurado,
+  zero setup extra.
 - **Blue/Green com `APP_COLOR`:** torna o switch visualmente
   verificável (roxo/azul/verde). O rollback é um único `kubectl patch`
   no selector do Service `app-go-active`.
