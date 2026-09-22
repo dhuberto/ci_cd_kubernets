@@ -1,6 +1,9 @@
 # =============================================================================
 # CD - Rolling Update
 # =============================================================================
+# Faz build, publica no GHCR e executa Rolling Update no K3s.
+# Na primeira execução, cria go.mod e gera go.sum automaticamente.
+# =============================================================================
 
 name: CD - Rolling Update
 
@@ -46,27 +49,81 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Configura o Go utilizado no build.
+      # Configura a versão do Go.
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.25"
           cache: false
 
-      # Verifica se os arquivos essenciais da aplicação existem.
+      # Cria go.mod na primeira execução e gera go.sum automaticamente.
+      - name: Preparar módulo Go
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "================================================="
+          echo "PREPARANDO MÓDULO GO"
+          echo "================================================="
+
+          if [ ! -f go.mod ]; then
+            echo "go.mod não encontrado."
+            echo "Criando módulo Go..."
+
+            cat > go.mod <<'EOF'
+          module app-go
+
+          go 1.25
+
+          require github.com/lib/pq v1.10.9
+          EOF
+          else
+            echo "go.mod já existe."
+          fi
+
+          echo ""
+          echo "Executando go mod tidy..."
+
+          go mod tidy
+
+          echo ""
+          echo "Módulo Go preparado."
+
+          echo ""
+          echo "Arquivos:"
+          ls -lh go.mod go.sum
+
+      # Valida os arquivos necessários para o build.
       - name: Validar aplicação
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f go.mod
-          test -f go.sum
-          test -f Dockerfile
-          test -f src/main.go
+          echo "================================================="
+          echo "VALIDAÇÃO DA APLICAÇÃO"
+          echo "================================================="
 
-          echo "Arquivos da aplicação encontrados."
+          missing=0
 
-      # Baixa e valida as dependências Go.
+          for file in go.mod go.sum Dockerfile src/main.go; do
+            if [ -f "$file" ]; then
+              echo "OK     $file"
+            else
+              echo "ERRO   $file não encontrado"
+              missing=1
+            fi
+          done
+
+          echo "================================================="
+
+          if [ "$missing" -ne 0 ]; then
+            echo "Arquivos obrigatórios estão faltando."
+            exit 1
+          fi
+
+          echo "Todos os arquivos necessários foram encontrados."
+
+      # Baixa e verifica as dependências.
       - name: Verificar dependências Go
         run: |
           set -euo pipefail
@@ -74,14 +131,14 @@ jobs:
           go mod download
           go mod verify
 
-      # Executa os testes automatizados.
+      # Executa os testes.
       - name: Testes
         run: |
           set -euo pipefail
 
           go test ./...
 
-      # Compila a aplicação para validar o código.
+      # Compila a aplicação.
       - name: Build Go
         run: |
           set -euo pipefail
@@ -92,7 +149,7 @@ jobs:
       - name: Setup Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Autentica no GitHub Container Registry.
+      # Autentica no GHCR.
       - name: Login GHCR
         uses: docker/login-action@v3
         with:
@@ -100,7 +157,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Constrói e publica a imagem Docker.
+      # Faz build e push da imagem.
       - name: Build & Push
         uses: docker/build-push-action@v6
         with:
@@ -109,7 +166,7 @@ jobs:
           tags: |
             ${{ env.IMAGE_NAME }}
 
-      # Registra informações do build no resumo do GitHub Actions.
+      # Registra o resultado do build.
       - name: Resumo do build
         run: |
           {
@@ -119,7 +176,7 @@ jobs:
             echo "- Tag: \`${IMAGE_TAG}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Faz o deploy da imagem no ambiente Kubernetes Rolling.
+  # Executa o deploy no K3s.
   deploy:
 
     name: Rolling Deploy
@@ -129,11 +186,11 @@ jobs:
 
     steps:
 
-      # Baixa os manifestos do repositório.
+      # Baixa novamente os manifests do repositório.
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Valida as principais variáveis antes do deploy.
+      # Valida as variáveis necessárias.
       - name: Validar configuração
         shell: bash
         run: |
@@ -148,7 +205,7 @@ jobs:
           echo "ROLLING_HOST=${ROLLING_HOST}"
           echo "IMAGE_NAME=${IMAGE_NAME}"
 
-      # Prepara a chave SSH utilizada para acessar a EC2.
+      # Configura a chave SSH.
       - name: Configurar chave SSH
         run: |
           set -euo pipefail
@@ -167,7 +224,7 @@ jobs:
 
           echo "Chave SSH válida."
 
-      # Testa a conexão SSH com a EC2.
+      # Testa o acesso à EC2.
       - name: Testar SSH
         run: |
           ssh \
@@ -177,7 +234,7 @@ jobs:
             "${EC2_USER}@${EC2_HOST}" \
             'echo "SSH OK"'
 
-      # Substitui IMAGE_PLACEHOLDER pela imagem publicada no GHCR.
+      # Substitui IMAGE_PLACEHOLDER pela imagem publicada.
       - name: Renderizar Deployment
         shell: bash
         run: |
@@ -187,17 +244,25 @@ jobs:
 
           test -f "$FILE"
 
-          echo "Validando placeholder..."
+          echo "================================================="
+          echo "VALIDANDO DEPLOYMENT"
+          echo "================================================="
 
           if ! grep -q 'IMAGE_PLACEHOLDER' "$FILE"; then
             echo "ERRO: IMAGE_PLACEHOLDER não encontrado."
+            echo ""
+            echo "Linha de imagem encontrada:"
+            grep -n 'image:' "$FILE" || true
             exit 1
           fi
+
+          echo "IMAGE_PLACEHOLDER encontrado."
 
           sed -i \
             "s|IMAGE_PLACEHOLDER|${IMAGE_NAME}|g" \
             "$FILE"
 
+          echo ""
           echo "Imagem utilizada:"
           grep -n 'image:' "$FILE"
 
@@ -211,9 +276,10 @@ jobs:
             exit 1
           fi
 
+          echo ""
           echo "Renderização OK."
 
-      # Valida todos os manifests YAML antes de enviá-los para a EC2.
+      # Valida a sintaxe dos manifests YAML.
       - name: Validar YAML
         shell: bash
         run: |
@@ -241,7 +307,7 @@ jobs:
             puts "Todos os manifests YAML estão válidos."
           '
 
-      # Cria o diretório remoto para receber os manifests.
+      # Cria o diretório remoto.
       - name: Preparar diretório remoto
         run: |
           ssh \
@@ -250,7 +316,7 @@ jobs:
             "${EC2_USER}@${EC2_HOST}" \
             'mkdir -p /home/ec2-user/rolling'
 
-      # Copia os manifests Rolling para a EC2.
+      # Copia os manifests para a EC2.
       - name: Copiar manifests
         run: |
           scp \
@@ -259,7 +325,7 @@ jobs:
             k8s/rolling/*.yaml \
             "${EC2_USER}@${EC2_HOST}:/home/ec2-user/rolling/"
 
-      # Confirma que o K3s está acessível usando sudo.
+      # Valida o acesso ao K3s com sudo.
       - name: Validar K3s
         run: |
           ssh \
@@ -278,7 +344,7 @@ jobs:
             'sudo /usr/local/bin/kubectl get namespace rolling >/dev/null 2>&1 ||
              sudo /usr/local/bin/kubectl create namespace rolling'
 
-      # Cria ou atualiza o Secret utilizado para baixar imagens privadas do GHCR.
+      # Cria ou atualiza o Secret para pull do GHCR.
       - name: Criar imagePullSecret
         run: |
           ssh \
@@ -292,7 +358,7 @@ jobs:
               --dry-run=client \
               -o yaml | sudo /usr/local/bin/kubectl apply -f -"
 
-      # Valida os manifests diretamente contra a API do Kubernetes.
+      # Valida os manifests contra a API do Kubernetes.
       - name: Validar manifests no Kubernetes
         run: |
           ssh \
@@ -303,7 +369,7 @@ jobs:
               --dry-run=server \
               -f /home/ec2-user/rolling/'
 
-      # Aplica Secret, Service e StatefulSet do PostgreSQL.
+      # Aplica PostgreSQL.
       - name: Aplicar PostgreSQL
         run: |
           ssh \
@@ -325,7 +391,7 @@ jobs:
                rollout status statefulset/postgres \
                --timeout=180s'
 
-      # Aplica o RBAC da aplicação.
+      # Aplica RBAC.
       - name: Aplicar RBAC
         run: |
           ssh \
@@ -335,7 +401,7 @@ jobs:
             'sudo /usr/local/bin/kubectl apply \
               -f /home/ec2-user/rolling/rbac.yaml'
 
-      # Aplica o Deployment com a nova imagem.
+      # Aplica o Deployment.
       - name: Aplicar Deployment
         run: |
           ssh \
@@ -345,7 +411,7 @@ jobs:
             'sudo /usr/local/bin/kubectl apply \
               -f /home/ec2-user/rolling/deployment.yaml'
 
-      # Aplica o Service da aplicação.
+      # Aplica o Service.
       - name: Aplicar Service
         run: |
           ssh \
@@ -365,7 +431,7 @@ jobs:
             'sudo /usr/local/bin/kubectl apply \
               -f /home/ec2-user/rolling/ingress.yaml'
 
-      # Aguarda a conclusão do Rolling Update.
+      # Aguarda o Rolling Update terminar.
       - name: Aguardar Rolling Update
         run: |
           ssh \
@@ -376,7 +442,7 @@ jobs:
               rollout status deployment/app-go \
               --timeout=180s'
 
-      # Coleta informações do cluster quando alguma etapa anterior falhar.
+      # Coleta informações do cluster se alguma etapa falhar.
       - name: Diagnóstico
         if: failure()
         run: |
@@ -426,7 +492,7 @@ jobs:
              echo "================================================="
              sudo /usr/local/bin/kubectl -n rolling get events --sort-by=.lastTimestamp'
 
-      # Testa o caminho externo EC2 → Ingress → Service → Pod.
+      # Testa EC2 → Ingress → Service → Pod usando rolling.local.
       - name: Smoke test via rolling.local
         run: |
           set -euo pipefail
@@ -472,7 +538,7 @@ jobs:
 
           exit 1
 
-      # Registra o resultado final do deploy.
+      # Registra o resultado do deploy.
       - name: Resumo
         if: success()
         run: |
