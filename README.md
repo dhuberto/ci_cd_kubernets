@@ -1,6 +1,16 @@
 # CI/CD — App-go (K3s na AWS)
 
+---
+
 [![CI](https://github.com/dhuberto/ci_cd_kubernets/actions/workflows/ci.yml/badge.svg)](https://github.com/dhuberto/ci_cd_kubernets/actions/workflows/ci.yml)
+[![Rolling](https://github.com/dhuberto/ci_cd_kubernets/actions/workflows/cd-rolling.yml/badge.svg)](https://github.com/dhuberto/ci_cd_kubernets/actions/workflows/cd-rolling.yml)
+[![Blue-Green-Switch](https://github.com/dhuberto/ci_cd_kubernets/actions/workflows/cd-blue-green-switch.yml/badge.svg)](https://github.com/dhuberto/ci_cd_kubernets/actions/workflows/cd-blue-green-switch.yml)
+[![App-blue-green](https://github.com/dhuberto/ci_cd_kubernets/actions/workflows/cd-blue-green.yml/badge.svg)](https://github.com/dhuberto/ci_cd_kubernets/actions/workflows/cd-blue-green.yml)
+[![Destroy-full](https://github.com/dhuberto/ci_cd_kubernets/actions/workflows/cd-destroy-full.yml/badge.svg)](https://github.com/dhuberto/ci_cd_kubernets/actions/workflows/cd-destroy-full.yml)
+[![Destroy](https://github.com/dhuberto/ci_cd_kubernets/actions/workflows/cd-destroy.yml/badge.svg)](https://github.com/dhuberto/ci_cd_kubernets/actions/workflows/cd-destroy.yml)
+[![provision](https://github.com/dhuberto/ci_cd_kubernets/actions/workflows/cd-provision.yml/badge.svg)](https://github.com/dhuberto/ci_cd_kubernets/actions/workflows/cd-provision.yml)
+
+---
 
 Pipeline completo de **CI/CD** para uma aplicação web em **Go + PostgreSQL**,
 com deploy automatizado em **K3s** (Kubernetes leve) na EC2, usando
