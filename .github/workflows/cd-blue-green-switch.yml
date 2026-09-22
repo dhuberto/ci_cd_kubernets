@@ -32,47 +32,81 @@ jobs:
     name: Switch para ${{ inputs.color }}
     runs-on: ubuntu-latest
     environment: aws
+
     steps:
+      # -----------------------------------------------------------------------
+      # SSH
+      # -----------------------------------------------------------------------
       - name: Configurar chave SSH
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
 
-      # O switch é só um patch no selector do Service active.
-      # kubectl patch é atômico e não recria nada.
+      # -----------------------------------------------------------------------
+      # CUTOVER
+      # -----------------------------------------------------------------------
+      # O switch é somente um patch no selector do Service active.
+      #
+      # Não recria Pods.
+      # Não executa rollout.
+      # Não altera os Deployments.
+      # O Service passa a selecionar a cor informada.
+      # -----------------------------------------------------------------------
       - name: Patch do Service (cutover mínimo e reversível)
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             ec2-user@${{ vars.EC2_PUBLIC_IP }} \
-            '/usr/local/bin/kubectl -n blue-green patch svc app-go-active \
-               -p "{\"spec\":{\"selector\":{\"app\":\"app-go\",\"slot\":\"${{ inputs.color }}\"}}}"'
+            'sudo /usr/local/bin/kubectl -n blue-green patch svc app-go-active \
+              -p "{\"spec\":{\"selector\":{\"app\":\"app-go\",\"slot\":\"${{ inputs.color }}\"}}}"'
 
-      # Confirma que o selector foi realmente trocado.
+      # -----------------------------------------------------------------------
+      # CONFIRMAÇÃO
+      # -----------------------------------------------------------------------
+      # Confirma que o selector foi realmente alterado.
+      # -----------------------------------------------------------------------
       - name: Confirmar selector
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             ec2-user@${{ vars.EC2_PUBLIC_IP }} \
-            '/usr/local/bin/kubectl -n blue-green get svc app-go-active \
-               -o jsonpath="{.spec.selector}"'
+            'sudo /usr/local/bin/kubectl -n blue-green get svc app-go-active \
+              -o jsonpath="{.spec.selector}"'
 
-      # Valida o caminho completo: navegador → ingress → active → pod.
+      # -----------------------------------------------------------------------
+      # SMOKE TEST VIA INGRESS
+      # -----------------------------------------------------------------------
+      # Valida o caminho completo:
+      #
+      # navegador/curl
+      #      ↓
+      # Ingress
+      #      ↓
+      # Service app-go-active
+      #      ↓
+      # Pod da cor selecionada
+      # -----------------------------------------------------------------------
       - name: Validar tráfego via Ingress
         run: |
           for i in $(seq 1 20); do
             code=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Host: todolist.local" \
-              http://${{ vars.EC2_PUBLIC_IP }}/healthz || true)
+              "http://${{ vars.EC2_PUBLIC_IP }}/healthz" || true)
+
             if [ "$code" = "200" ]; then
               echo "Smoke OK (tentativa $i)"
               exit 0
             fi
+
             echo "tentativa $i — code=$code"
             sleep 3
           done
+
           echo "Switch aplicado, mas o smoke test via Ingress falhou." >&2
           exit 1
 
+      # -----------------------------------------------------------------------
+      # RESUMO
+      # -----------------------------------------------------------------------
       - name: Resumo
         run: |
           {
@@ -83,4 +117,4 @@ jobs:
             echo "- Host: \`todolist.local\`"
             echo ""
             echo "**Rollback:** rode este workflow novamente com a cor contrária."
-          } >> $GITHUB_STEP_SUMMARY
+          } >> "$GITHUB_STEP_SUMMARY"
