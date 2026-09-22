@@ -1,39 +1,6 @@
 # =============================================================================
 # CD - Rolling Update
 # =============================================================================
-#
-# Fluxo:
-#
-#   GitHub Actions
-#        |
-#        v
-#   Build da aplicação
-#        |
-#        v
-#   Push GHCR
-#        |
-#        v
-#   SSH EC2
-#        |
-#        v
-#   K3s
-#        |
-#        v
-#   PostgreSQL
-#        |
-#        v
-#   Deployment Rolling
-#        |
-#        v
-#   Service
-#        |
-#        v
-#   Ingress
-#        |
-#        v
-#   rolling.local
-#
-# =============================================================================
 
 name: CD - Rolling Update
 
@@ -53,67 +20,44 @@ concurrency:
   group: rolling-${{ github.ref }}
   cancel-in-progress: false
 
+# Variáveis globais do pipeline.
 env:
   IMAGE_TAG: ${{ inputs.image_tag == 'latest' && github.sha || inputs.image_tag }}
-
   IMAGE_NAME: ghcr.io/${{ github.repository }}:${{ inputs.image_tag == 'latest' && github.sha || inputs.image_tag }}
-
   EC2_USER: ec2-user
   EC2_HOST: ${{ vars.EC2_PUBLIC_IP }}
-
   NAMESPACE: rolling
   APP_NAME: app-go
-
   ROLLING_HOST: rolling.local
-
   KUBECTL: sudo /usr/local/bin/kubectl
-
-
-# =============================================================================
-# BUILD
-# =============================================================================
 
 jobs:
 
+  # Build, testes e publicação da imagem no GHCR.
   build-and-push:
 
     name: Build & Push
-
     runs-on: ubuntu-latest
-
     environment: aws
 
     steps:
 
-      # -----------------------------------------------------------------------
-      # Checkout
-      # -----------------------------------------------------------------------
-
+      # Baixa o código do repositório.
       - name: Checkout
         uses: actions/checkout@v4
 
-
-      # -----------------------------------------------------------------------
-      # Go
-      # -----------------------------------------------------------------------
-
+      # Configura o Go utilizado no build.
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.25"
           cache: false
 
-
-      # -----------------------------------------------------------------------
-      # Validar aplicação
-      # -----------------------------------------------------------------------
-
+      # Verifica se os arquivos essenciais da aplicação existem.
       - name: Validar aplicação
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "Validando arquivos..."
 
           test -f go.mod
           test -f go.sum
@@ -122,81 +66,50 @@ jobs:
 
           echo "Arquivos da aplicação encontrados."
 
-
-      # -----------------------------------------------------------------------
-      # Dependências Go
-      # -----------------------------------------------------------------------
-
+      # Baixa e valida as dependências Go.
       - name: Verificar dependências Go
         run: |
           set -euo pipefail
 
           go mod download
-
           go mod verify
 
-
-      # -----------------------------------------------------------------------
-      # Testes
-      # -----------------------------------------------------------------------
-
+      # Executa os testes automatizados.
       - name: Testes
         run: |
           set -euo pipefail
 
           go test ./...
 
-
-      # -----------------------------------------------------------------------
-      # Build local
-      # -----------------------------------------------------------------------
-
+      # Compila a aplicação para validar o código.
       - name: Build Go
         run: |
           set -euo pipefail
 
           go build -o /tmp/app-go ./src
 
-
-      # -----------------------------------------------------------------------
-      # Buildx
-      # -----------------------------------------------------------------------
-
+      # Configura Docker Buildx.
       - name: Setup Buildx
         uses: docker/setup-buildx-action@v3
 
-
-      # -----------------------------------------------------------------------
-      # Login GHCR
-      # -----------------------------------------------------------------------
-
+      # Autentica no GitHub Container Registry.
       - name: Login GHCR
         uses: docker/login-action@v3
-
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-
-      # -----------------------------------------------------------------------
-      # Build + Push
-      # -----------------------------------------------------------------------
-
+      # Constrói e publica a imagem Docker.
       - name: Build & Push
         uses: docker/build-push-action@v6
-
         with:
           context: .
           push: true
-
           tags: |
             ${{ env.IMAGE_NAME }}
 
-      # -----------------------------------------------------------------------
-      # Resumo
-      # -----------------------------------------------------------------------
-
+      # Registra informações do build no resumo do GitHub Actions.
       - name: Resumo do build
         run: |
           {
@@ -206,35 +119,21 @@ jobs:
             echo "- Tag: \`${IMAGE_TAG}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-
-# =============================================================================
-# DEPLOY
-# =============================================================================
-
+  # Faz o deploy da imagem no ambiente Kubernetes Rolling.
   deploy:
 
     name: Rolling Deploy
-
     needs: build-and-push
-
     runs-on: ubuntu-latest
-
     environment: aws
 
     steps:
 
-      # -----------------------------------------------------------------------
-      # Checkout
-      # -----------------------------------------------------------------------
-
+      # Baixa os manifestos do repositório.
       - name: Checkout
         uses: actions/checkout@v4
 
-
-      # -----------------------------------------------------------------------
-      # Validar variáveis
-      # -----------------------------------------------------------------------
-
+      # Valida as principais variáveis antes do deploy.
       - name: Validar configuração
         shell: bash
         run: |
@@ -249,11 +148,7 @@ jobs:
           echo "ROLLING_HOST=${ROLLING_HOST}"
           echo "IMAGE_NAME=${IMAGE_NAME}"
 
-
-      # -----------------------------------------------------------------------
-      # SSH
-      # -----------------------------------------------------------------------
-
+      # Prepara a chave SSH utilizada para acessar a EC2.
       - name: Configurar chave SSH
         run: |
           set -euo pipefail
@@ -272,11 +167,7 @@ jobs:
 
           echo "Chave SSH válida."
 
-
-      # -----------------------------------------------------------------------
-      # Testar SSH
-      # -----------------------------------------------------------------------
-
+      # Testa a conexão SSH com a EC2.
       - name: Testar SSH
         run: |
           ssh \
@@ -286,11 +177,7 @@ jobs:
             "${EC2_USER}@${EC2_HOST}" \
             'echo "SSH OK"'
 
-
-      # -----------------------------------------------------------------------
-      # Renderizar Deployment
-      # -----------------------------------------------------------------------
-
+      # Substitui IMAGE_PLACEHOLDER pela imagem publicada no GHCR.
       - name: Renderizar Deployment
         shell: bash
         run: |
@@ -300,40 +187,19 @@ jobs:
 
           test -f "$FILE"
 
-          echo "==============================================="
-          echo "VALIDANDO DEPLOYMENT"
-          echo "==============================================="
+          echo "Validando placeholder..."
 
           if ! grep -q 'IMAGE_PLACEHOLDER' "$FILE"; then
-
             echo "ERRO: IMAGE_PLACEHOLDER não encontrado."
-
-            echo ""
-            echo "Arquivo atual:"
-            cat "$FILE"
-
             exit 1
           fi
-
-          echo "IMAGE_PLACEHOLDER encontrado."
-
-          echo ""
-          echo "Imagem:"
-          echo "${IMAGE_NAME}"
 
           sed -i \
             "s|IMAGE_PLACEHOLDER|${IMAGE_NAME}|g" \
             "$FILE"
 
-          echo ""
-          echo "==============================================="
-          echo "DEPLOYMENT RENDERIZADO"
-          echo "==============================================="
-
+          echo "Imagem utilizada:"
           grep -n 'image:' "$FILE"
-
-          echo ""
-          echo "Validando imagem..."
 
           if grep -q 'IMAGE_PLACEHOLDER' "$FILE"; then
             echo "ERRO: placeholder ainda existe."
@@ -345,14 +211,9 @@ jobs:
             exit 1
           fi
 
-          echo ""
           echo "Renderização OK."
 
-
-      # -----------------------------------------------------------------------
-      # Validar YAML
-      # -----------------------------------------------------------------------
-
+      # Valida todos os manifests YAML antes de enviá-los para a EC2.
       - name: Validar YAML
         shell: bash
         run: |
@@ -380,11 +241,7 @@ jobs:
             puts "Todos os manifests YAML estão válidos."
           '
 
-
-      # -----------------------------------------------------------------------
-      # Preparar diretório remoto
-      # -----------------------------------------------------------------------
-
+      # Cria o diretório remoto para receber os manifests.
       - name: Preparar diretório remoto
         run: |
           ssh \
@@ -393,11 +250,7 @@ jobs:
             "${EC2_USER}@${EC2_HOST}" \
             'mkdir -p /home/ec2-user/rolling'
 
-
-      # -----------------------------------------------------------------------
-      # Copiar manifests
-      # -----------------------------------------------------------------------
-
+      # Copia os manifests Rolling para a EC2.
       - name: Copiar manifests
         run: |
           scp \
@@ -406,11 +259,7 @@ jobs:
             k8s/rolling/*.yaml \
             "${EC2_USER}@${EC2_HOST}:/home/ec2-user/rolling/"
 
-
-      # -----------------------------------------------------------------------
-      # Validar K3s
-      # -----------------------------------------------------------------------
-
+      # Confirma que o K3s está acessível usando sudo.
       - name: Validar K3s
         run: |
           ssh \
@@ -419,11 +268,7 @@ jobs:
             "${EC2_USER}@${EC2_HOST}" \
             'sudo /usr/local/bin/kubectl get nodes -o wide'
 
-
-      # -----------------------------------------------------------------------
-      # Namespace
-      # -----------------------------------------------------------------------
-
+      # Garante que o namespace rolling exista.
       - name: Garantir namespace
         run: |
           ssh \
@@ -433,11 +278,7 @@ jobs:
             'sudo /usr/local/bin/kubectl get namespace rolling >/dev/null 2>&1 ||
              sudo /usr/local/bin/kubectl create namespace rolling'
 
-
-      # -----------------------------------------------------------------------
-      # GHCR Secret
-      # -----------------------------------------------------------------------
-
+      # Cria ou atualiza o Secret utilizado para baixar imagens privadas do GHCR.
       - name: Criar imagePullSecret
         run: |
           ssh \
@@ -451,11 +292,7 @@ jobs:
               --dry-run=client \
               -o yaml | sudo /usr/local/bin/kubectl apply -f -"
 
-
-      # -----------------------------------------------------------------------
-      # Dry Run Kubernetes
-      # -----------------------------------------------------------------------
-
+      # Valida os manifests diretamente contra a API do Kubernetes.
       - name: Validar manifests no Kubernetes
         run: |
           ssh \
@@ -466,11 +303,7 @@ jobs:
               --dry-run=server \
               -f /home/ec2-user/rolling/'
 
-
-      # -----------------------------------------------------------------------
-      # PostgreSQL
-      # -----------------------------------------------------------------------
-
+      # Aplica Secret, Service e StatefulSet do PostgreSQL.
       - name: Aplicar PostgreSQL
         run: |
           ssh \
@@ -492,11 +325,7 @@ jobs:
                rollout status statefulset/postgres \
                --timeout=180s'
 
-
-      # -----------------------------------------------------------------------
-      # RBAC
-      # -----------------------------------------------------------------------
-
+      # Aplica o RBAC da aplicação.
       - name: Aplicar RBAC
         run: |
           ssh \
@@ -506,11 +335,7 @@ jobs:
             'sudo /usr/local/bin/kubectl apply \
               -f /home/ec2-user/rolling/rbac.yaml'
 
-
-      # -----------------------------------------------------------------------
-      # Deployment
-      # -----------------------------------------------------------------------
-
+      # Aplica o Deployment com a nova imagem.
       - name: Aplicar Deployment
         run: |
           ssh \
@@ -520,11 +345,7 @@ jobs:
             'sudo /usr/local/bin/kubectl apply \
               -f /home/ec2-user/rolling/deployment.yaml'
 
-
-      # -----------------------------------------------------------------------
-      # Service
-      # -----------------------------------------------------------------------
-
+      # Aplica o Service da aplicação.
       - name: Aplicar Service
         run: |
           ssh \
@@ -534,11 +355,7 @@ jobs:
             'sudo /usr/local/bin/kubectl apply \
               -f /home/ec2-user/rolling/service.yaml'
 
-
-      # -----------------------------------------------------------------------
-      # Ingress
-      # -----------------------------------------------------------------------
-
+      # Aplica o Ingress rolling.local.
       - name: Aplicar Ingress
         run: |
           ssh \
@@ -548,11 +365,7 @@ jobs:
             'sudo /usr/local/bin/kubectl apply \
               -f /home/ec2-user/rolling/ingress.yaml'
 
-
-      # -----------------------------------------------------------------------
-      # Rollout
-      # -----------------------------------------------------------------------
-
+      # Aguarda a conclusão do Rolling Update.
       - name: Aguardar Rolling Update
         run: |
           ssh \
@@ -563,11 +376,7 @@ jobs:
               rollout status deployment/app-go \
               --timeout=180s'
 
-
-      # -----------------------------------------------------------------------
-      # Diagnóstico em caso de erro
-      # -----------------------------------------------------------------------
-
+      # Coleta informações do cluster quando alguma etapa anterior falhar.
       - name: Diagnóstico
         if: failure()
         run: |
@@ -580,71 +389,44 @@ jobs:
              echo "================================================="
              echo "NODES"
              echo "================================================="
-
              sudo /usr/local/bin/kubectl get nodes -o wide
-
 
              echo "================================================="
              echo "PODS"
              echo "================================================="
-
-             sudo /usr/local/bin/kubectl -n rolling \
-               get pods -o wide
-
+             sudo /usr/local/bin/kubectl -n rolling get pods -o wide
 
              echo "================================================="
              echo "DEPLOYMENT"
              echo "================================================="
-
-             sudo /usr/local/bin/kubectl -n rolling \
-               get deployment app-go -o wide
-
+             sudo /usr/local/bin/kubectl -n rolling get deployment app-go -o wide
 
              echo "================================================="
              echo "REPLICASETS"
              echo "================================================="
-
-             sudo /usr/local/bin/kubectl -n rolling \
-               get replicasets -o wide
-
+             sudo /usr/local/bin/kubectl -n rolling get replicasets -o wide
 
              echo "================================================="
              echo "SERVICE"
              echo "================================================="
-
-             sudo /usr/local/bin/kubectl -n rolling \
-               get service app-go -o wide
-
+             sudo /usr/local/bin/kubectl -n rolling get service app-go -o wide
 
              echo "================================================="
              echo "ENDPOINTS"
              echo "================================================="
-
-             sudo /usr/local/bin/kubectl -n rolling \
-               get endpoints app-go -o wide
-
+             sudo /usr/local/bin/kubectl -n rolling get endpoints app-go -o wide
 
              echo "================================================="
              echo "INGRESS"
              echo "================================================="
-
-             sudo /usr/local/bin/kubectl -n rolling \
-               get ingress app-go -o yaml
-
+             sudo /usr/local/bin/kubectl -n rolling get ingress app-go -o yaml
 
              echo "================================================="
              echo "EVENTS"
              echo "================================================="
+             sudo /usr/local/bin/kubectl -n rolling get events --sort-by=.lastTimestamp'
 
-             sudo /usr/local/bin/kubectl -n rolling \
-               get events \
-               --sort-by=.lastTimestamp'
-
-
-      # -----------------------------------------------------------------------
-      # Smoke test
-      # -----------------------------------------------------------------------
-
+      # Testa o caminho externo EC2 → Ingress → Service → Pod.
       - name: Smoke test via rolling.local
         run: |
           set -euo pipefail
@@ -652,11 +434,9 @@ jobs:
           echo "================================================="
           echo "SMOKE TEST"
           echo "================================================="
-
           echo "IP:   ${EC2_HOST}"
           echo "Host: ${ROLLING_HOST}"
           echo "Path: /healthz"
-
           echo "================================================="
 
           for i in $(seq 1 20); do
@@ -672,16 +452,13 @@ jobs:
               || true)
 
             if [ "$code" = "200" ]; then
-
               echo ""
               echo "Smoke OK."
               echo "Tentativa: ${i}"
-
               exit 0
             fi
 
             echo "tentativa ${i}/20 — HTTP ${code}"
-
             sleep 5
           done
 
@@ -689,18 +466,13 @@ jobs:
           echo "================================================="
           echo "SMOKE TEST FALHOU"
           echo "================================================="
-
           echo "IP:   ${EC2_HOST}"
           echo "Host: ${ROLLING_HOST}"
           echo "Path: /healthz"
 
           exit 1
 
-
-      # -----------------------------------------------------------------------
-      # Resumo
-      # -----------------------------------------------------------------------
-
+      # Registra o resultado final do deploy.
       - name: Resumo
         if: success()
         run: |
