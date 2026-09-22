@@ -1,7 +1,7 @@
 # =============================================================================
 # CD - Provision Infra
 # =============================================================================
-# Provisiona AWS via Terraform e configura kind + ingress-nginx + namespaces
+# Provisiona AWS via Terraform e configura kubernets + ingress-nginx + namespaces
 # na EC2 via Ansible.
 #
 # Fluxo:
@@ -37,7 +37,7 @@ concurrency:
 
 jobs:
   provision:
-    name: Provision EC2 + kind + ingress-nginx
+    name: Provision EC2 + kubernets + ingress-nginx
     runs-on: ubuntu-latest
     environment: aws
     outputs:
